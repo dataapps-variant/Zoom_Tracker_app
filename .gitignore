@@ -1,0 +1,20 @@
+# Data files (contain meeting data)
+breakout_room_attendance_log.csv
+zoom_raw_payloads.json
+*.csv
+*.json
+!room_names.json
+
+# Large files
+ngrok.exe
+ngrok.zip
+*.exe
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
