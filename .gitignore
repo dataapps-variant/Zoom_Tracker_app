@@ -5,6 +5,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.env
 
 # IDE
 .vscode/
@@ -15,5 +16,12 @@ __pycache__/
 Thumbs.db
 nul
 
-# ngrok binary (download separately)
+# ngrok binary
 ngrok.exe
+
+# Generated reports (local only)
+reports/
+
+# Local data files
+*.json
+!package.json
