@@ -276,11 +276,17 @@ def main():
     webhook_url = WEBHOOK_URL
     date_str = date.today().strftime('%Y-%m-%d')
 
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg == '--webhook-url' and i+2 < len(sys.argv):
-            webhook_url = sys.argv[i+2]
-        elif arg.count('-') == 2:  # Date format YYYY-MM-DD
-            date_str = arg
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == '--webhook-url' and i+1 < len(args):
+            webhook_url = args[i+1]
+            i += 2
+        elif len(args[i]) == 10 and args[i][4] == '-' and args[i][7] == '-':  # YYYY-MM-DD format
+            date_str = args[i]
+            i += 1
+        else:
+            i += 1
 
     target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
     print(f'Date: {date_str}')
