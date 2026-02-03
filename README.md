@@ -1,160 +1,167 @@
 # Zoom Breakout Room Tracker
 
-Track participant activity across Zoom breakout rooms including room visits, duration, and camera usage.
+Track participant movement across Zoom breakout rooms with camera activity data.
 
 ## Features
+- Captures breakout room join/leave events via Zoom webhooks
+- Tracks camera on/off time using Zoom QOS API
+- Generates detailed CSV reports with:
+  - Participant name and email
+  - Meeting join/leave times
+  - Room-by-room journey tracking
+  - Camera usage statistics
 
-- Track which breakout rooms each participant visited
-- Record join/leave times for each room
-- Monitor camera on/off time per participant
-- Generate detailed daily reports in CSV format
-- Automatic tracking with scheduled scripts
+## Quick Start (Cloud Deployment - Recommended)
 
-## Output Report Format
+### Step 1: Deploy to Render (Free)
 
-| Column | Description |
-|--------|-------------|
-| Participant Name | Name of the participant |
-| Email ID | Participant's email |
-| Meeting Join Time | When they joined the meeting |
-| Meeting Left Time | When they left the meeting |
-| Meeting Total Duration | Total time in meeting (mins) |
-| Room Number/Name | Breakout room name or ID |
-| Room Join Time | When they joined this room |
-| Room Left Time | When they left this room |
-| Room Duration | Time spent in this room (mins) |
-| Camera ON Time | Minutes with camera on |
-| Camera OFF Time | Minutes with camera off |
-| Camera ON % | Percentage of time camera was on |
-| Next Room | Which room they went to next |
+1. **Create Render Account**
+   - Go to https://render.com and sign up (free)
 
-## Prerequisites
+2. **Connect GitHub**
+   - Click "New" -> "Web Service"
+   - Connect your GitHub account
+   - Select this repository: `dataapps-variant/Zoom_Tracker`
 
-- Python 3.8+
-- ngrok account (free) - [Download](https://ngrok.com/download)
-- Zoom Server-to-Server OAuth App
-
-## Installation
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/zoom-breakout-tracker.git
-   cd zoom-breakout-tracker
+3. **Configure Service**
+   ```
+   Name: zoom-webhook
+   Region: Oregon (or closest to you)
+   Branch: main
+   Runtime: Python 3
+   Build Command: pip install -r requirements.txt
+   Start Command: gunicorn zoom_webhook_listener:app
+   Instance Type: Free
    ```
 
-2. Install dependencies:
-   ```bash
-   pip install flask requests
-   ```
+4. **Add Environment Variable**
+   - Go to "Environment" tab
+   - Add: `ZOOM_WEBHOOK_SECRET` = `r72xUnMLTHOgHcgZS3Np7Q`
 
-3. Download ngrok and place `ngrok.exe` in this folder
+5. **Deploy**
+   - Click "Create Web Service"
+   - Wait for deployment (2-3 minutes)
+   - Copy your URL: `https://zoom-webhook-xxxx.onrender.com`
 
-4. Configure your Zoom credentials in `generate_daily_report.py`:
-   ```python
-   ACCOUNT_ID = 'your_account_id'
-   CLIENT_ID = 'your_client_id'
-   CLIENT_SECRET = 'your_client_secret'
-   MEETING_ID = 'your_meeting_id'
-   ```
+### Step 2: Update Zoom Webhook URL
 
-5. Configure the same credentials in `zoom_webhook_listener.py`:
-   ```python
-   SECRET_TOKEN = "your_webhook_secret_token"
-   ```
+1. Go to https://marketplace.zoom.us/
+2. Open your Server-to-Server OAuth app
+3. Go to "Feature" -> "Event Subscriptions"
+4. Update webhook URL to: `https://your-render-url.onrender.com/webhook`
+5. Click "Save"
 
-## Zoom App Setup
+### Step 3: Generate Reports
 
-1. Go to [Zoom Marketplace](https://marketplace.zoom.us/)
-2. Create a **Server-to-Server OAuth** app
-3. Add scopes: `meeting:read:admin`, `dashboard_meetings:read:admin`
-4. Enable **Event Subscriptions**
-5. Add events:
-   - `meeting.participant_joined_breakout_room`
-   - `meeting.participant_left_breakout_room`
-6. Set webhook URL to your ngrok URL (e.g., `https://xxxx.ngrok.io/webhook`)
+After each meeting, run locally:
 
-## Usage
-
-### Manual Method
-
-**Step 1: Start ngrok (Terminal 1)**
 ```bash
-ngrok http 5000
+# Install dependencies (once)
+pip install requests
+
+# Generate today's report
+python download_and_report.py --webhook-url https://your-render-url.onrender.com
+
+# Generate specific date report
+python download_and_report.py 2026-02-02 --webhook-url https://your-render-url.onrender.com
 ```
-Copy the HTTPS URL and update in Zoom webhook settings.
 
-**Step 2: Start webhook listener (Terminal 2)**
+## Alternative: Local Setup
+
+If you prefer running locally:
+
 ```bash
+# Install dependencies
+pip install flask requests
+
+# Start webhook server
 python zoom_webhook_listener.py
-```
 
-**Step 3: After meeting ends, stop the webhook (Ctrl+C)**
+# In another terminal, expose via ngrok
+ngrok http 5000
 
-**Step 4: Generate report**
-```bash
-python generate_daily_report.py --date 2024-02-02
-```
-
-### Automated Method (Windows)
-
-1. Edit meeting times in `auto_tracker.py`:
-   ```python
-   MEETING_START_HOUR = 9    # 9:00 AM
-   MEETING_END_HOUR = 13     # 1:00 PM
-   ```
-
-2. Add to Windows Startup:
-   - Press `Win + R`, type `shell:startup`
-   - Copy `start_auto_tracker.vbs` to that folder
-
-3. The script will automatically:
-   - Start webhook before meeting
-   - Capture all room data
-   - Stop webhook after meeting
-   - Generate report
-
-## Commands
-
-```bash
-# Generate report for specific date
-python generate_daily_report.py --date 2024-02-02
-
-# Generate report for yesterday
+# Update Zoom webhook URL to ngrok URL
+# Run meeting
+# Generate report
 python generate_daily_report.py
-
-# List available meetings
-python generate_daily_report.py --list
-
-# Name your rooms interactively
-python generate_daily_report.py --date 2024-02-02 --setup
 ```
 
-## Files
+## File Structure
 
-| File | Purpose |
-|------|---------|
-| `zoom_webhook_listener.py` | Captures room join/leave events |
-| `generate_daily_report.py` | Generates CSV reports |
-| `auto_tracker.py` | Automated scheduling script |
-| `start_auto_tracker.vbs` | Silent startup script |
-| `zoom_raw_payloads.json` | Webhook data (auto-generated) |
-| `room_name_mapping.json` | Room UUID to name mapping |
-| `reports/` | Output CSV files |
+```
+zoom+tracker/
+├── zoom_webhook_listener.py   # Cloud-ready webhook server
+├── download_and_report.py     # Download data & generate reports
+├── generate_daily_report.py   # Local report generator (standalone)
+├── requirements.txt           # Python dependencies
+├── Procfile                   # Cloud deployment config
+└── reports/                   # Generated CSV reports
+```
+
+## API Endpoints
+
+When deployed, your webhook provides:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Health check |
+| `/webhook` | POST | Zoom webhook receiver |
+| `/data` | GET | Download all captured events |
+| `/data/today` | GET | Download today's events only |
+| `/data/clear` | POST | Clear stored data |
+| `/status` | GET | Detailed status info |
+
+## Configuration
+
+### Zoom App Settings
+
+Required scopes:
+- `meeting:read:meeting:admin`
+- `dashboard_meetings:read:admin`
+
+Webhook events to subscribe:
+- `meeting.participant_joined_breakout_room`
+- `meeting.participant_left_breakout_room`
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `ZOOM_WEBHOOK_SECRET` | Zoom webhook secret token | (required) |
+| `PORT` | Server port | 5000 |
+
+## Report Output
+
+CSV columns:
+1. Participant Name
+2. Email ID
+3. Meeting Join Time
+4. Meeting Left Time
+5. Meeting Duration (mins)
+6. Room Name
+7. Room Join Time
+8. Room Left Time
+9. Room Duration (mins)
+10. Camera ON (mins)
+11. Camera OFF (mins)
+12. Camera %
+13. Next Room
 
 ## Troubleshooting
 
-### No webhook data found
-- Make sure `zoom_webhook_listener.py` was running during the meeting
-- Check that ngrok was running and URL was set in Zoom
+**No data captured?**
+- Ensure webhook URL is correct in Zoom app
+- Check Render logs for incoming events
+- Verify webhook events are enabled in Zoom
 
-### Camera data not available
-- QOS data takes 2-4 hours to be available after meeting
-- Check your Zoom API credentials
+**Camera data shows 0%?**
+- QOS data requires ~24 hours to be available
+- Meeting must have Dashboard access enabled
 
-### Room names showing as UUIDs
-- Run with `--setup` flag to name rooms interactively
-- Room UUIDs change each meeting, so setup once per meeting series
+**Connection errors?**
+- Render free tier may sleep after 15 min inactivity
+- First request wakes it up (may take 30 seconds)
 
 ## License
 
-MIT License
+MIT
