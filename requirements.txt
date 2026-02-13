@@ -9,7 +9,9 @@
 # requests: Call Zoom API (for camera data)
 
 flask==3.0.0
+flask-cors==4.0.0
 gunicorn==21.2.0
 google-cloud-bigquery==3.14.1
 google-cloud-storage==2.14.0
 requests==2.31.0
+pandas==2.1.4

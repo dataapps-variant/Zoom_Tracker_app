@@ -7,7 +7,8 @@
 -- ==============================================================================
 -- STEP 1: CREATE DATASET
 -- ==============================================================================
-CREATE SCHEMA IF NOT EXISTS `your-project-id.zoom_tracker`
+
+CREATE SCHEMA IF NOT EXISTS `1041741270489.zoom_tracker`
 OPTIONS (
   description = 'Zoom breakout room tracking data',
   location = 'US'
@@ -31,7 +32,7 @@ OPTIONS (
 -- raw_payload     : Original JSON for debugging
 -- gcs_path        : Where raw file stored in GCS
 
-CREATE TABLE IF NOT EXISTS `your-project-id.zoom_tracker.raw_events` (
+CREATE TABLE IF NOT EXISTS `1041741270489.zoom_tracker.raw_events` (
   event_id STRING NOT NULL,
   event_date DATE,                    -- NEW: For easy date filtering
   event_type STRING,
@@ -49,6 +50,40 @@ CREATE TABLE IF NOT EXISTS `your-project-id.zoom_tracker.raw_events` (
 )
 PARTITION BY event_date              -- Partition by date for fast queries
 CLUSTER BY participant_name, action; -- Cluster for common query patterns
+
+-- ==============================================================================
+-- STEP 2B: ADD ROOM_NAME COLUMN (run if table exists)
+-- ==============================================================================
+-- Adds room_name column to existing raw_events table
+
+-- ALTER TABLE `1041741270489.zoom_tracker.raw_events`
+-- ADD COLUMN IF NOT EXISTS room_name STRING;
+
+-- ==============================================================================
+-- STEP 2C: CREATE ROOM MAPPINGS TABLE
+-- ==============================================================================
+-- Stores room UUID to name mappings discovered by scout bot or Zoom App
+--
+-- FIELDS:
+-- meeting_id   : Zoom meeting ID
+-- meeting_uuid : Unique meeting instance
+-- room_uuid    : Breakout room UUID from webhook (the anonymous one)
+-- room_name    : Human-readable room name (e.g., "Math Class")
+-- mapped_at    : When this mapping was discovered
+-- mapping_date : Date for partitioning
+-- source       : How the mapping was discovered (scout_bot, zoom_app)
+
+CREATE TABLE IF NOT EXISTS `1041741270489.zoom_tracker.room_mappings` (
+  meeting_id STRING NOT NULL,
+  meeting_uuid STRING,
+  room_uuid STRING NOT NULL,
+  room_name STRING NOT NULL,
+  mapped_at TIMESTAMP,
+  mapping_date DATE,
+  source STRING                        -- "scout_bot" or "zoom_app"
+)
+PARTITION BY mapping_date
+CLUSTER BY meeting_id, room_uuid;
 
 -- ==============================================================================
 -- STEP 3: CREATE DAILY REPORTS TABLE
@@ -73,7 +108,7 @@ CLUSTER BY participant_name, action; -- Cluster for common query patterns
 -- camera_percentage   : % of time camera was ON
 -- next_room           : Where they went next
 
-CREATE TABLE IF NOT EXISTS `your-project-id.zoom_tracker.daily_reports` (
+CREATE TABLE IF NOT EXISTS `1041741270489.zoom_tracker.daily_reports` (
   -- Date
   report_date DATE NOT NULL,
 
@@ -113,7 +148,7 @@ CLUSTER BY participant_name;
 -- ==============================================================================
 -- Quick view of each participant's activity per day
 
-CREATE OR REPLACE VIEW `your-project-id.zoom_tracker.participant_summary` AS
+CREATE OR REPLACE VIEW `1041741270489.zoom_tracker.participant_summary` AS
 SELECT
   report_date,
   participant_name,
@@ -124,7 +159,7 @@ SELECT
   COUNT(*) as rooms_visited,
   SUM(room_duration_mins) as total_room_time_mins,
   AVG(camera_percentage) as avg_camera_percentage
-FROM `your-project-id.zoom_tracker.daily_reports`
+FROM `1041741270489.zoom_tracker.daily_reports`
 GROUP BY 1, 2, 3, 4, 5, 6
 ORDER BY report_date DESC, participant_name;
 
@@ -133,7 +168,7 @@ ORDER BY report_date DESC, participant_name;
 -- ==============================================================================
 -- See activity per room per day
 
-CREATE OR REPLACE VIEW `your-project-id.zoom_tracker.room_activity` AS
+CREATE OR REPLACE VIEW `1041741270489.zoom_tracker.room_activity` AS
 SELECT
   report_date,
   room_name,
@@ -142,6 +177,6 @@ SELECT
   COUNT(*) as total_visits,
   AVG(room_duration_mins) as avg_time_in_room_mins,
   AVG(camera_percentage) as avg_camera_percentage
-FROM `your-project-id.zoom_tracker.daily_reports`
+FROM `1041741270489.zoom_tracker.daily_reports`
 GROUP BY 1, 2, 3
 ORDER BY report_date DESC, room_name;
