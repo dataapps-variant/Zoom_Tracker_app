@@ -182,3 +182,19 @@ To integrate with your existing `zoom_webhook_bigquery.py`:
 2. Deploy to your hosting (Vercel, Netlify, Cloud Run)
 3. Update Zoom App settings with production URLs
 4. Submit app for Zoom review (required for other users)
+
+
+
+# Check BigQuery config and table counts                                                                                                     curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/bigquery                                                      
+                                                                                                                                             
+  # Test webhook insert
+  curl -X POST https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/webhook-insert -H "Content-Type: application/json" -d
+  "{}"
+
+  # Test QoS insert
+  curl -X POST https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/qos-insert -H "Content-Type: application/json" -d "{}"
+
+  View logs:
+  gcloud run logs read breakout-room-calibrator --region us-central1 --limit 50
+
+  Run the first one (/test/bigquery) to verify config is correct before testing inserts.

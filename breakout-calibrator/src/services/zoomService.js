@@ -7,7 +7,7 @@
 
 const BOT_NAME = process.env.REACT_APP_BOT_NAME || 'Scout Bot';
 const BOT_EMAIL = process.env.REACT_APP_BOT_EMAIL || '';
-const MOVE_DELAY_MS = 3000; // 3 seconds between room moves
+const MOVE_DELAY_MS = 10000; // 10 seconds between room moves (time for Scout Bot to click Join and enter)
 const MAX_RETRIES = 2;
 
 // Room mapping cache (persists across calibration runs)

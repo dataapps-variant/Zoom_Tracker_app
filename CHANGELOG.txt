@@ -1,0 +1,166 @@
+================================================================================
+ZOOM BREAKOUT ROOM TRACKER - DEVELOPMENT CHANGELOG
+================================================================================
+This file documents all changes made during development sessions.
+Last Updated: 2026-02-17
+
+================================================================================
+SESSION: 2026-02-17 (Current)
+================================================================================
+
+ISSUE: Room names showing as "Room-XXXXXXXX" instead of actual names
+CAUSE: Webhook UUIDs have different format than SDK UUIDs
+       - SDK format: {E7F123FC-EE33-47D8-BC5E-C84FCD31E06F}
+       - Webhook format: n0a1FJhALeimJ5UPLUTxiw== (base64-like)
+
+SOLUTION: Capture webhook UUIDs during Scout Bot calibration
+
+CHANGES MADE:
+
+1. app.py - Added webhook UUID capture during calibration
+   - Added `pending_room_moves` queue to MeetingState class
+   - Added `calibration_in_progress` flag
+   - Updated `handle_breakout_room_join()` to detect Scout Bot and map webhook UUID
+   - Updated `/calibration/start` to initialize calibration tracking
+   - Updated `/calibration/mapping` to track pending room moves
+   - Updated `/calibration/complete` to report webhook matches
+
+2. breakout-calibrator/src/components/CalibrationPanel.jsx
+   - Fixed `handleSelfCalibration()` to notify backend before each move
+   - Added calls to `notifyCalibrationStart()`, `sendRoomMapping()`, `notifyCalibrationComplete()`
+   - Backend now knows which room Scout Bot is entering
+
+3. breakout-calibrator/src/services/zoomService.js
+   - Changed MOVE_DELAY_MS from 3000ms to 10000ms (10 seconds)
+   - Gives Scout Bot time to click "Join" and enter room before next move
+
+4. Created: attendance_report_with_room_names.sql
+   - SQL query that joins webhook events with room mappings
+   - Uses multiple matching strategies (exact UUID, short UUID, case-insensitive)
+
+FILES DELETED (cleanup):
+   - complete-deploy.zip
+   - deploy-package.zip
+   - update-deploy.zip
+   - TOMORROW_STEPS.md
+   - GCP_DEPLOYMENT_PLAN.md
+   - GCP_SETUP_GUIDE.md
+   - zoom_webhook_bigquery.py (replaced by app.py)
+   - bigquery_setup.sql (duplicate of bigquery_schemas.sql)
+   - check_uuids.sql (temporary debug)
+   - debug_mappings.sql (temporary debug)
+   - report_query.sql (replaced by attendance_report_with_room_names.sql)
+   - quick-deploy.sh
+   - deploy.sh
+   - nul (empty file)
+
+DEPLOYMENTS:
+   - Revision 26: Initial webhook calibration fix
+   - Revision 27: Fixed self-calibration to notify backend
+   - Revision 28: Increased move delay to 10 seconds
+
+================================================================================
+SESSION: 2026-02-16
+================================================================================
+
+ISSUE: BigQuery data returning 0 for all queries
+CAUSE: Multiple issues with data extraction and insertion
+
+FIXES APPLIED:
+1. Duration conversion - Zoom API returns seconds, was stored as minutes
+2. Added extract_participant_data() with comprehensive fallbacks
+3. Added validate_and_clean_event() before all BQ inserts
+4. Full payload logging in webhook handler
+5. Traceback logging on failures
+6. Test endpoints: /test/webhook-insert, /test/qos-insert, /test/bigquery
+
+================================================================================
+SESSION: 2026-02-12
+================================================================================
+
+ISSUE: Calibration showed success but Scout Bot never moved
+CAUSE: Wrong SDK parameter name
+
+FIX: useZoomSdk.js - Changed `uuid` to `breakoutRoomUUID` in assignParticipantToBreakoutRoom()
+
+LESSON LEARNED:
+- SDK returns `breakoutRoomId`, NOT `breakoutRoomUUID`
+- Use fallback chain for room UUID:
+  const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.uuid
+
+================================================================================
+EARLIER SESSIONS
+================================================================================
+
+- Initial project setup with Flask server
+- Zoom webhook integration
+- BigQuery table creation
+- React Zoom App (breakout-calibrator) creation
+- Cloud Run deployment
+- Zoom Marketplace app configuration
+
+================================================================================
+KEY LESSONS LEARNED
+================================================================================
+
+1. UUID FORMAT MISMATCH
+   - SDK UUIDs: {GUID-FORMAT-WITH-BRACES}
+   - Webhook UUIDs: base64-like string
+   - Solution: Store both formats, use room NAMES as common key
+
+2. SDK PARAMETER NAMES
+   - assignParticipantToBreakoutRoom needs: participantUUID, breakoutRoomUUID
+   - Room object has: breakoutRoomId (not breakoutRoomUUID!)
+   - Participant object has: participantUUID
+
+3. ZOOM SECURITY
+   - Participants must click "Join" to enter breakout rooms
+   - SDK cannot force participants into rooms
+   - Calibration requires someone to click "Join" on each popup
+
+4. TIMING
+   - Room entry takes ~5 seconds after clicking "Join"
+   - Need sufficient delay between moves (10 seconds works well)
+
+================================================================================
+USEFUL COMMANDS
+================================================================================
+
+# Deploy to Cloud Run
+cd C:\Users\shash\Downloads\zoom+tracker
+gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated
+
+# Build React app before deploy
+cd breakout-calibrator && npm run build && cd ..
+
+# Check logs
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
+
+# Check BigQuery mappings
+SELECT source, COUNT(*) FROM `variant-finance-data-project.breakout_room_calibrator.room_mappings` WHERE mapping_date = CURRENT_DATE() GROUP BY source;
+
+# Test BigQuery connection
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/bigquery
+
+================================================================================
+CURRENT STATE (2026-02-17)
+================================================================================
+
+Cloud Run URL: https://breakout-room-calibrator-1041741270489.us-central1.run.app
+GCP Project: variant-finance-data-project
+BigQuery Dataset: breakout_room_calibrator
+
+Tables:
+- participant_events: 1988 records
+- room_mappings: 331 records
+- camera_events: 0 records
+- qos_data: 4 records
+
+Calibration Status:
+- SDK mappings (zoom_sdk_app): Working
+- Webhook mappings (webhook_calibration): Needs calibration with Scout Bot clicking "Join"
+
+NEXT STEP FOR USER:
+Run calibration with Scout Bot clicking "Join" on each room popup to capture webhook UUIDs.
+
+================================================================================

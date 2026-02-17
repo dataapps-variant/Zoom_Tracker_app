@@ -1,11 +1,32 @@
 /**
  * API Service
  * Handles communication with your backend server
+ *
+ * In Cloud Run: React app served from same domain, uses relative URLs
+ * In Development: Uses localhost:8080
  */
 
 import axios from 'axios';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8080';
+// Get the backend URL
+// In Cloud Run: Same origin (relative URL works)
+// In development: Use explicit localhost
+const getBackendUrl = () => {
+  // If REACT_APP_BACKEND_URL is set, use it
+  if (process.env.REACT_APP_BACKEND_URL) {
+    return process.env.REACT_APP_BACKEND_URL;
+  }
+
+  // In production (Cloud Run), use relative URL (same origin)
+  if (process.env.NODE_ENV === 'production') {
+    return '';  // Empty string = same origin
+  }
+
+  // In development, use localhost
+  return 'http://localhost:8080';
+};
+
+const BACKEND_URL = getBackendUrl();
 
 const api = axios.create({
   baseURL: BACKEND_URL,
@@ -95,7 +116,7 @@ export async function getExistingMappings(meetingId) {
 export async function checkBackendHealth() {
   try {
     const response = await api.get('/health');
-    return response.data.status === 'ok';
+    return response.data.status === 'healthy';
   } catch (err) {
     return false;
   }

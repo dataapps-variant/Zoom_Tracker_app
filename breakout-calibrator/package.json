@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Zoom App for automated scout bot calibration through breakout rooms",
   "private": true,
+  "homepage": "/app",
   "dependencies": {
     "@zoom/appssdk": "^0.16.0",
     "axios": "^1.6.0",

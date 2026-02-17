@@ -172,6 +172,14 @@ function CalibrationPanel() {
       setErrorMessage('');
       setDebugLogs(['=== SELF-CALIBRATION MODE ===', 'You will move through each room']);
 
+      // Get meeting info
+      const meetingUUID = await getMeetingUUID();
+      const meetingId = meetingContext?.meetingID;
+
+      // Notify backend that calibration is starting
+      await notifyCalibrationStart(meetingId, meetingUUID);
+      setDebugLogs(prev => [...prev, `Notified backend: calibration started`]);
+
       // Get rooms
       const breakoutRooms = await getBreakoutRooms();
       setRooms(breakoutRooms);
@@ -196,18 +204,33 @@ function CalibrationPanel() {
         }
 
         try {
+          // IMPORTANT: Send mapping to backend BEFORE moving
+          // This tells the backend which room Scout Bot is about to enter
+          const mapping = { room_uuid: cleanUUID, room_name: roomName, room_index: i };
+          await sendRoomMapping(meetingId, meetingUUID, [mapping]);
+          setDebugLogs(prev => [...prev, `Sent mapping to backend: ${roomName}`]);
+
+          // Now actually move to the room
           const response = await changeMyBreakoutRoom(roomUUID);
           setDebugLogs(prev => [...prev, `Room ${i + 1} response: ${JSON.stringify(response)}`]);
 
           mappings.push({ roomUUID: cleanUUID, roomName, roomIndex: i });
           setMappedRooms([...mappings]);
 
-          // Wait 3 seconds before next move
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          // Wait 5 seconds for webhook to arrive and be processed
+          await new Promise(resolve => setTimeout(resolve, 5000));
         } catch (moveErr) {
           setDebugLogs(prev => [...prev, `ERROR moving to room ${i + 1}: ${moveErr.message}`]);
         }
       }
+
+      // Notify backend that calibration is complete
+      await notifyCalibrationComplete(meetingId, meetingUUID, {
+        totalRooms: breakoutRooms.length,
+        mappedRooms: mappings.length,
+        success: true
+      });
+      setDebugLogs(prev => [...prev, `Notified backend: calibration complete`]);
 
       setUiState(UI_STATES.COMPLETE);
       setStatusMessage(`Self-calibration complete: ${mappings.length} rooms`);
@@ -220,7 +243,7 @@ function CalibrationPanel() {
       setUiState(UI_STATES.ERROR);
       setCurrentRoom(-1);
     }
-  }, [isConfigured, getBreakoutRooms, changeMyBreakoutRoom]);
+  }, [isConfigured, meetingContext, getMeetingUUID, getBreakoutRooms, changeMyBreakoutRoom]);
 
   const handleReset = useCallback(() => {
     setUiState(UI_STATES.IDLE);

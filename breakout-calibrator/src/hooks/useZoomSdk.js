@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import zoomSdk from '@zoom/appssdk';
 
+// Only request capabilities that are registered in Zoom Marketplace
 const CAPABILITIES = [
   'getBreakoutRoomList',
   'getMeetingParticipants',
@@ -8,10 +9,7 @@ const CAPABILITIES = [
   'changeBreakoutRoom',
   'getMeetingContext',
   'getMeetingUUID',
-  'getUserContext',
-  'onBreakoutRoomChange',
-  'onParticipantChange',
-  'onMeetingConfigChanged'
+  'getUserContext'
 ];
 
 export function useZoomSdk() {
@@ -25,34 +23,37 @@ export function useZoomSdk() {
   useEffect(() => {
     async function initializeSdk() {
       try {
-        // Configure the SDK with required capabilities
+        console.log('Initializing Zoom SDK...');
+
+        // Configure the SDK - use installed version 0.16.x
         const configResponse = await zoomSdk.config({
-          capabilities: CAPABILITIES,
-          version: '0.16.0'
+          capabilities: CAPABILITIES
         });
 
         console.log('Zoom SDK configured:', configResponse);
         setIsConfigured(true);
 
         // Get meeting context
-        const meeting = await zoomSdk.getMeetingContext();
-        setMeetingContext(meeting);
-        console.log('Meeting context:', meeting);
+        try {
+          const meeting = await zoomSdk.getMeetingContext();
+          setMeetingContext(meeting);
+          console.log('Meeting context:', meeting);
+        } catch (e) {
+          console.log('Could not get meeting context:', e.message);
+        }
 
         // Get user context to check if host
-        const user = await zoomSdk.getUserContext();
-        setUserContext(user);
-        setIsHost(user.role === 'host' || user.role === 'coHost');
-        console.log('User context:', user);
-
-        // Set up event listeners
-        zoomSdk.onBreakoutRoomChange((event) => {
-          console.log('Breakout room changed:', event);
-        });
-
-        zoomSdk.onParticipantChange((event) => {
-          console.log('Participant changed:', event);
-        });
+        try {
+          const user = await zoomSdk.getUserContext();
+          setUserContext(user);
+          // Check for various role formats
+          const role = (user.role || '').toLowerCase();
+          setIsHost(role === 'host' || role === 'cohost' || role === 'co-host');
+          console.log('User context:', user);
+          console.log('User role:', user.role, '-> isHost:', role === 'host' || role === 'cohost' || role === 'co-host');
+        } catch (e) {
+          console.log('Could not get user context:', e.message);
+        }
 
       } catch (err) {
         console.error('Failed to initialize Zoom SDK:', err);
@@ -70,11 +71,15 @@ export function useZoomSdk() {
     }
 
     try {
+      console.log('Calling getBreakoutRoomList...');
       const response = await zoomSdk.getBreakoutRoomList();
-      console.log('Breakout rooms:', response);
-      return response.rooms || [];
+      console.log('Breakout rooms response:', JSON.stringify(response));
+      const rooms = response.rooms || response.breakoutRooms || [];
+      console.log('Found', rooms.length, 'rooms');
+      return rooms;
     } catch (err) {
       console.error('Failed to get breakout rooms:', err);
+      console.error('Error details:', JSON.stringify(err));
       throw err;
     }
   }, [isConfigured]);

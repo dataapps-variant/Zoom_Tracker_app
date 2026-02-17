@@ -1,0 +1,33 @@
+# Node modules (build happens before Docker)
+breakout-calibrator/node_modules
+node_modules
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+venv
+.env
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+test_*
+*_test.py
+
+# Local config
+.env.local
+*.log

@@ -1,17 +1,22 @@
 # ==============================================================================
-# PYTHON DEPENDENCIES FOR GCP CLOUD RUN + GCS + BIGQUERY
+# PYTHON DEPENDENCIES - Zoom Breakout Room Tracker v2.0
 # ==============================================================================
-#
-# flask: Web framework for webhook HTTP requests
-# gunicorn: Production web server
-# google-cloud-bigquery: Write/query data in BigQuery
-# google-cloud-storage: Write raw JSON to GCS bucket
-# requests: Call Zoom API (for camera data)
+# GCP Cloud Run + BigQuery + Email Reports
 
+# Web Framework
 flask==3.0.0
 flask-cors==4.0.0
 gunicorn==21.2.0
+
+# Google Cloud
 google-cloud-bigquery==3.14.1
 google-cloud-storage==2.14.0
+
+# HTTP Requests (Zoom API)
 requests==2.31.0
-pandas==2.1.4
+
+# Email Reports (SendGrid)
+sendgrid==6.10.0
+
+# Cloud Functions (for scheduled reports)
+functions-framework==3.5.0

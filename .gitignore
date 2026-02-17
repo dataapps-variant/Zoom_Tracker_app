@@ -5,12 +5,18 @@
 __pycache__/
 *.pyc
 *.pyo
+venv/
+
+# Environment files (sensitive)
 .env
+*.env
+breakout-calibrator/.env
 
 # IDE
 .vscode/
 .idea/
 .claude/
+.qodo/
 
 # Windows temp
 Thumbs.db
@@ -19,9 +25,22 @@ nul
 # ngrok binary
 ngrok.exe
 
+# Node.js
+node_modules/
+breakout-calibrator/node_modules/
+
+# Build artifacts
+breakout-calibrator/build/
+
 # Generated reports (local only)
 reports/
 
 # Local data files
 *.json
 !package.json
+!package-lock.json
+!breakout-calibrator/package.json
+!breakout-calibrator/package-lock.json
+
+# Zip files
+*.zip

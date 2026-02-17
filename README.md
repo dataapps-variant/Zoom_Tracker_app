@@ -1,112 +1,109 @@
 # Zoom Breakout Room Tracker
 
-A system to track participants in Zoom breakout rooms by mapping room UUIDs to human-readable names, with webhook-based real-time event capture.
+A complete solution for tracking participant attendance in Zoom breakout rooms with proper room name resolution. Deployed on Google Cloud Run with BigQuery storage.
 
-## Problem Statement
+## Overview
 
-Zoom webhooks provide breakout room events with **UUIDs** (e.g., `6kAkE8jOgeGj5m2DPy9/`) but **not room names**. This makes it impossible to know which room (e.g., "Cloud Gunners" or "HR Connect Room") a participant joined.
+This system captures participant activity in Zoom meetings and breakout rooms, storing data in BigQuery for reporting. It solves the challenge of mapping Zoom's internal room UUIDs to human-readable room names.
 
-## Solution Architecture
+### Key Features
+- Real-time participant join/leave tracking via Zoom Webhooks
+- Breakout room visit tracking with proper room names
+- Camera on/off event tracking
+- QoS data collection (duration, attentiveness)
+- Daily attendance reports with actual room names (not UUIDs)
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           ZOOM BREAKOUT ROOM TRACKER                         │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Zoom Meeting │     │   Zoom App   │     │ Flask Server │     │   Storage    │
-│  (Host + Bot) │     │  (React SDK) │     │  (Webhooks)  │     │ (BigQuery)   │
-└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-       │                    │                    │                    │
-       │ 1. Create breakout │                    │                    │
-       │    rooms           │                    │                    │
-       │                    │                    │                    │
-       │ 2. Open Zoom App ──┼────────────────────┤                    │
-       │    (calibration)   │                    │                    │
-       │                    │                    │                    │
-       │                    │ 3. SDK gets room   │                    │
-       │                    │    list with NAMES │                    │
-       │                    │    & UUIDs         │                    │
-       │                    │                    │                    │
-       │                    │ 4. Send mapping ───┼──► Store UUID→Name │
-       │                    │    to server       │    mapping         │
-       │                    │                    │                    │
-       │ 5. Participant     │                    │                    │
-       │    joins room ─────┼────────────────────┼──► Webhook event   │
-       │                    │                    │    (has UUID)      │
-       │                    │                    │                    │
-       │                    │                    │ 6. Enrich with ────┼──► Store with
-       │                    │                    │    room NAME       │    room name!
-       └────────────────────┴────────────────────┴────────────────────┴─────────────
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+│   Zoom Meeting  │────>│  Zoom Webhooks   │────>│  Cloud Run (app.py) │
+│ (Breakout Rooms)│     │                  │     │                     │
+└─────────────────┘     └──────────────────┘     └──────────┬──────────┘
+                                                            │
+┌─────────────────┐     ┌──────────────────┐               │
+│  Zoom Apps SDK  │────>│  Calibration     │───────────────┘
+│  (In-meeting)   │     │  Endpoints       │               │
+└─────────────────┘     └──────────────────┘               │
+                                                            v
+                                                   ┌─────────────┐
+                                                   │  BigQuery   │
+                                                   │  (Storage)  │
+                                                   └─────────────┘
 ```
 
-## Components
+## The UUID Mapping Problem & Solution
 
-### 1. Flask Server (`zoom_webhook_bigquery.py`)
-- **Port**: 8080
-- **Webhook endpoint**: `/webhook` - Receives Zoom events
-- **Calibration endpoints**:
-  - `POST /calibration/start` - Start calibration session
-  - `POST /calibration/mapping` - Receive room mappings from SDK
-  - `POST /calibration/complete` - Mark calibration done
-- **Data endpoints**:
-  - `GET /data` - View captured events
-  - `GET /scout/all-mappings` - View all room name mappings
-  - `GET /scout/status` - Check calibration status
+**Problem:** Zoom webhooks send room UUIDs like `n0a1FJhALeimJ5UPLUTxiw==` but we need room names like `1.1:It's Accrual World`. The SDK uses different UUID format `{E7F123FC-...}` than webhooks.
 
-### 2. React Zoom App (`breakout-calibrator/`)
-- Uses `@zoom/appssdk` to access in-meeting data
-- Gets breakout room list with names (only available via SDK, not REST API!)
-- Sends mappings to Flask server
-- Two calibration modes:
-  - **Move Scout Bot**: Host moves another participant through rooms
-  - **Move Myself**: Participant moves themselves through rooms
+**Solution:** Scout Bot Calibration
+1. A participant named "Scout Bot" joins the meeting
+2. Host runs the Zoom App and clicks "Move Scout Bot"
+3. Scout Bot clicks "Join" on each room popup
+4. When Scout Bot enters a room, the webhook captures the webhook UUID
+5. The app maps webhook UUID to the SDK room name
+6. All future participant events use this mapping for proper room names
 
-### 3. ngrok Tunnel
-- Exposes localhost:8080 to the internet
-- Required for Zoom webhooks and Zoom App URLs
+## Project Structure
 
-## Why This Approach?
+```
+zoom-tracker/
+├── app.py                                 # Main Flask server
+├── Dockerfile                             # Container config for Cloud Run
+├── requirements.txt                       # Python dependencies
+├── bigquery_schemas.sql                   # BigQuery table definitions
+├── attendance_report_with_room_names.sql  # Main report query
+├── report_generator.py                    # Daily report generation
+└── breakout-calibrator/                   # Zoom Apps SDK React app
+    ├── src/
+    │   ├── components/CalibrationPanel.jsx
+    │   ├── hooks/useZoomSdk.js
+    │   └── services/
+    │       ├── zoomService.js
+    │       └── apiService.js
+    ├── build/                             # Production build
+    └── package.json
+```
 
-### The Problem with Zoom's API
-1. **Webhooks don't include room names** - Only UUIDs like `6kAkE8jOgeGj5m2DPy9/`
-2. **REST API doesn't work for PMR** - `/meetings/{id}/breakout_rooms` returns 404 for Personal Meeting Rooms
-3. **SDK UUIDs differ from Webhook UUIDs** - SDK returns `{E7F123FC-...}` format, webhooks use base64-like format
+## Current Deployment
 
-### Our Solution
-1. Use **Zoom Apps SDK** (runs inside the meeting) to get room names + SDK UUIDs
-2. Store mapping: **Room Name → SDK UUID**
-3. When webhooks arrive, we can't directly map UUID, but we have the room names for reference
-4. For full tracking, the calibration captures room names which can be matched by position/index
+- **Cloud Run URL:** `https://breakout-room-calibrator-1041741270489.us-central1.run.app`
+- **GCP Project:** `variant-finance-data-project`
+- **BigQuery Dataset:** `breakout_room_calibrator`
 
-## Initial Setup (One-Time)
+## Zoom Credentials
 
-### Prerequisites
-- Python 3.8+
-- Node.js 16+
-- Zoom App credentials (created in Zoom Marketplace)
-- ngrok account
+| Type | ID |
+|------|-----|
+| Account ID | `xhKbAsmnSM6pNYYYurmqIA` |
+| Server-to-Server Client ID | `TqtBGqTAS3W1Jgf9a41w` |
+| Zoom App Client ID | `raEkn6HpTkWO_DCO3z5zGA` |
 
-### 1. Install Dependencies
+## Setup Guide
+
+### 1. BigQuery Setup
 
 ```bash
-# Backend
-pip install -r requirements.txt
-
-# Frontend (Zoom App)
-cd breakout-calibrator
-npm install
+bq mk --dataset variant-finance-data-project:breakout_room_calibrator
 ```
 
-### 2. Configure Zoom App
+Run `bigquery_schemas.sql` in BigQuery Console to create tables.
 
-1. Go to [Zoom Marketplace](https://marketplace.zoom.us/)
-2. Create a "Zoom App" (Meeting SDK type)
-3. Configure URLs (update with your ngrok URL):
-   - **Home URL**: `https://<ngrok-url>/app`
-   - **OAuth Redirect URL**: `https://<ngrok-url>/app`
-4. Add Scopes: `zoomapp:inmeeting`
-5. Add SDK Capabilities:
+### 2. Zoom Marketplace Setup
+
+#### A. Server-to-Server OAuth App (for API calls)
+1. Create "Server-to-Server OAuth" app
+2. Add scopes: `meeting:read:admin`, `user:read:admin`
+3. Note: Account ID, Client ID, Client Secret
+
+#### B. User-Managed App (for Zoom Apps SDK)
+1. Create "User-managed" app
+2. Configure URLs:
+   - **Home URL:** `https://breakout-room-calibrator-1041741270489.us-central1.run.app/app`
+   - **OAuth Redirect URL:** `https://breakout-room-calibrator-1041741270489.us-central1.run.app/app`
+3. Add scope: `zoomapp:inmeeting`
+4. Enable "In-Meeting" feature
+5. Add SDK capabilities:
    - `getBreakoutRoomList`
    - `getMeetingParticipants`
    - `assignParticipantToBreakoutRoom`
@@ -115,336 +112,192 @@ npm install
    - `getMeetingUUID`
    - `getUserContext`
 
-### 3. Configure Webhooks
-
-1. In your Zoom App settings, enable Event Subscriptions
-2. **Webhook URL**: `https://<ngrok-url>/webhook`
-3. **Subscribe to events**:
-   - `meeting.participant_joined_breakout_room`
-   - `meeting.participant_left_breakout_room`
+#### C. Configure Webhooks
+1. **Webhook URL:** `https://breakout-room-calibrator-1041741270489.us-central1.run.app/webhook`
+2. Add events:
    - `meeting.participant_joined`
    - `meeting.participant_left`
-4. Copy the **Secret Token** and update in `zoom_webhook_bigquery.py`:
-   ```python
-   ZOOM_WEBHOOK_SECRET = 'your-secret-token'
-   ```
+   - `meeting.participant_joined_breakout_room`
+   - `meeting.participant_left_breakout_room`
+   - `meeting.participant_video_on`
+   - `meeting.participant_video_off`
+   - `meeting.ended`
 
-### 4. Build React App
+### 3. Deploy to Cloud Run
 
 ```bash
+# Build React app
 cd breakout-calibrator
+npm install
 npm run build
+cd ..
+
+# Deploy
+gcloud run deploy breakout-room-calibrator \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars "GCP_PROJECT_ID=variant-finance-data-project,BQ_DATASET=breakout_room_calibrator,SCOUT_BOT_NAME=Scout Bot"
 ```
 
----
+## Daily Usage
 
-## Daily Usage Steps
+### Calibration Process (Required for Room Name Mapping)
 
-### Step 1: Start ngrok
-```bash
-ngrok http 8080
-```
-Copy the HTTPS URL (e.g., `https://abc123.ngrok-free.app`)
+**Setup:** Two people needed
+- **Person 1 (Host):** Runs the Zoom App
+- **Person 2 (Scout Bot):** Separate account named "Scout Bot"
 
-### Step 2: Update Zoom App URLs (if ngrok URL changed)
-Go to Zoom Marketplace → Your App → Update:
-- Home URL: `https://<new-ngrok-url>/app`
-- OAuth Redirect URL: `https://<new-ngrok-url>/app`
-- Webhook URL: `https://<new-ngrok-url>/webhook`
+**Steps:**
+1. Host starts meeting with breakout rooms OPEN
+2. Scout Bot account joins the meeting
+3. Host opens Apps → "Breakout Room Calibrator"
+4. Host clicks **"Move Scout Bot"**
+5. Scout Bot clicks **"Join"** on each popup (10 sec per room)
+6. Wait until all rooms are mapped
 
-### Step 3: Start Flask Server
-```bash
-python zoom_webhook_bigquery.py
-```
+**Timing:** ~10 minutes for 66 rooms (10 seconds each)
 
-### Step 4: Start Zoom Meeting
-1. Start your meeting as host
-2. Create/open breakout rooms (must be OPEN, not just created)
-3. Optional: Have "Scout Bot" participant join
+### Verify Calibration
 
-### Step 5: Run Calibration
-1. In Zoom meeting, click "Apps" → Find your Zoom App ("Breakout Calibrator")
-2. Open the app
-3. Click **"Move Scout Bot"** (if you have a Scout Bot participant) or **"Move Myself"**
-4. Wait for all rooms to be mapped (shows progress)
-
-### Step 6: Verify Mappings
-```bash
-curl http://localhost:8080/scout/all-mappings
+Run in BigQuery:
+```sql
+SELECT source, COUNT(*) as count
+FROM `variant-finance-data-project.breakout_room_calibrator.room_mappings`
+WHERE mapping_date = CURRENT_DATE()
+GROUP BY source;
 ```
 
----
+Should show both:
+- `zoom_sdk_app` - SDK mappings
+- `webhook_calibration` - Webhook UUID mappings
 
-## File Structure
+### Generate Reports
 
-```
-zoom+tracker/
-├── zoom_webhook_bigquery.py    # Main Flask server (webhooks + API)
-├── requirements.txt            # Python dependencies
-├── bigquery_setup.sql          # BigQuery schema (optional cloud storage)
-├── Dockerfile                  # For cloud deployment
-├── README.md                   # This file
-├── TOMORROW_STEPS.md           # Quick daily setup checklist
-└── breakout-calibrator/        # React Zoom App
-    ├── package.json
-    ├── public/
-    │   └── index.html
-    └── src/
-        ├── App.js
-        ├── index.js
-        ├── components/
-        │   ├── CalibrationPanel.jsx   # Main UI component
-        │   ├── StatusMessage.jsx
-        │   ├── ProgressIndicator.jsx
-        │   └── RoomList.jsx
-        ├── hooks/
-        │   └── useZoomSdk.js          # Zoom SDK integration
-        └── services/
-            ├── apiService.js          # Backend API calls
-            └── zoomService.js         # Calibration logic
-```
+Run `attendance_report_with_room_names.sql` in BigQuery Console.
 
----
+## API Endpoints
 
-## How the Calibration Works
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check |
+| `/webhook` | POST | Zoom webhook receiver |
+| `/calibration/start` | POST | Start calibration |
+| `/calibration/mapping` | POST | Receive room mappings |
+| `/calibration/complete` | POST | Complete calibration |
+| `/calibration/status` | GET | Check status |
+| `/mappings` | GET | Get room mappings |
+| `/app` | GET | Zoom SDK app |
+| `/test/bigquery` | GET | Test BigQuery |
+| `/debug/state` | GET | View meeting state |
 
-### Flow Diagram
+## BigQuery Tables
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     CALIBRATION FLOW                                 │
-└─────────────────────────────────────────────────────────────────────┘
+| Table | Description |
+|-------|-------------|
+| `participant_events` | Join/leave/room events |
+| `room_mappings` | UUID to room name mappings |
+| `camera_events` | Video on/off events |
+| `qos_data` | Quality/duration data |
 
-1. User clicks "Start Calibration" in Zoom App
-                    │
-                    ▼
-2. SDK calls getBreakoutRoomList()
-   Returns: [
-     { breakoutRoomId: "{E7F123FC-...}", name: "1.1:It's Accrual World" },
-     { breakoutRoomId: "{3F9F659C-...}", name: "1.2:Between The Spreadsheet" },
-     ...
-   ]
-                    │
-                    ▼
-3. SDK calls getMeetingParticipants()
-   Returns: [
-     { participantUUID: "abc123", name: "Scout Bot" },
-     { participantUUID: "def456", name: "John Doe" },
-     ...
-   ]
-                    │
-                    ▼
-4. Find "Scout Bot" in participant list
-                    │
-                    ▼
-5. For each room:
-   └─► SDK calls assignParticipantToBreakoutRoom({
-         participantUUID: "abc123",
-         breakoutRoomUUID: "{E7F123FC-...}"
-       })
-   └─► Wait 3 seconds for move to complete
-   └─► Record mapping: UUID → Room Name
-                    │
-                    ▼
-6. Send all mappings to Flask server:
-   POST /calibration/mapping
-   {
-     "room_mapping": [
-       { "room_uuid": "{E7F123FC-...}", "room_name": "1.1:It's Accrual World" },
-       ...
-     ]
-   }
-                    │
-                    ▼
-7. Server stores mappings in memory:
-   uuid_to_name["{E7F123FC-...}"] = "1.1:It's Accrual World"
-   uuid_to_name["E7F123FC-..."] = "1.1:It's Accrual World"  # Also stripped version
-```
+## Environment Variables
 
-### Key Code Locations
+| Variable | Description |
+|----------|-------------|
+| `GCP_PROJECT_ID` | Google Cloud project ID |
+| `BQ_DATASET` | BigQuery dataset name |
+| `ZOOM_WEBHOOK_SECRET` | Webhook verification secret |
+| `ZOOM_ACCOUNT_ID` | Server-to-Server Account ID |
+| `ZOOM_CLIENT_ID` | Server-to-Server Client ID |
+| `ZOOM_CLIENT_SECRET` | Server-to-Server Client Secret |
+| `SCOUT_BOT_NAME` | Bot name (default: "Scout Bot") |
 
-| What | File | Function |
-|------|------|----------|
-| SDK initialization | `useZoomSdk.js` | `useEffect` hook |
-| Get room list | `useZoomSdk.js` | `getBreakoutRooms()` |
-| Move participant | `useZoomSdk.js` | `moveParticipantToRoom()` |
-| Calibration logic | `zoomService.js` | `runCalibration()` |
-| Find Scout Bot | `zoomService.js` | `findScoutBot()` |
-| UI component | `CalibrationPanel.jsx` | `handleStartCalibration()` |
-| Store mappings | `zoom_webhook_bigquery.py` | `/calibration/mapping` endpoint |
+## Known Issues & Limitations (Zoom SDK/Webhook)
 
----
+### Issue 1: UUID Format Mismatch Between SDK and Webhooks
 
-## Room Mapping Storage
+**Problem:** Zoom SDK and Webhooks use completely different UUID formats for the same room.
+- SDK UUID format: `{E7F123FC-EE33-47D8-BC5E-C84FCD31E06F}` (GUID with braces)
+- Webhook UUID format: `n0a1FJhALeimJ5UPLUTxiw==` (base64-like string)
 
-The server stores mappings in multiple formats:
+**Impact:** Cannot directly match SDK room data with webhook events.
 
-```python
-room_mapper = {
-    # Look up room name by UUID
-    'uuid_to_name': {
-        '{E7F123FC-...}': '1.1:It\'s Accrual World',  # SDK format with braces
-        'E7F123FC-...': '1.1:It\'s Accrual World',    # Stripped format
-    },
+**Solution:** Scout Bot must physically enter each room during calibration. When Scout Bot joins a room:
+1. The SDK knows which room name Scout Bot is moving to
+2. The webhook sends the webhook UUID when Scout Bot enters
+3. We capture and store: `webhook_uuid → room_name`
 
-    # Look up UUID by room name
-    'name_to_uuid': {
-        '1.1:It\'s Accrual World': '{E7F123FC-...}'
-    },
+### Issue 2: SDK Cannot Force Participants Into Rooms
 
-    # Full SDK mapping data with room index
-    'sdk_mappings': {
-        '1.1:It\'s Accrual World': {
-            'sdk_uuid': '{E7F123FC-...}',
-            'room_index': 0
-        }
-    }
-}
-```
+**Problem:** Zoom's security prevents the SDK from automatically moving participants into breakout rooms without their consent.
+- `assignParticipantToBreakoutRoom()` sends an invitation popup
+- `changeBreakoutRoom()` also shows a confirmation popup
+- Participant MUST click "Join" to actually enter the room
 
----
+**Impact:** Calibration cannot be fully automated. Someone must manually click "Join" on each popup.
 
-## API Reference
+**Solution:** Two-person calibration process:
+1. Host clicks "Move Scout Bot" in the app
+2. Scout Bot (separate account) clicks "Join" on each popup
+3. Each room takes ~10 seconds (time to click + enter room)
 
-### Webhook Endpoint
+### Issue 3: Webhooks Only Fire on Actual Room Entry
 
-**POST /webhook**
-- Receives Zoom webhook events
-- Handles URL validation challenge automatically
-- Stores events in memory and optionally BigQuery
+**Problem:** Zoom only sends `participant_joined_breakout_room` webhook when a participant **actually enters** the room, not when they are assigned/invited.
 
-### Data Endpoints
+**Impact:** If Scout Bot doesn't click "Join", no webhook fires, and the UUID mapping is not captured.
 
-**GET /data**
-```json
-{
-  "events": [...],
-  "total_count": 150
-}
-```
+**Solution:** Scout Bot MUST click "Join" on every room popup during calibration. There is no workaround for this Zoom limitation.
 
-**GET /scout/all-mappings**
-```json
-{
-  "uuid_to_name": {...},
-  "name_to_uuid": {...},
-  "sdk_mappings": {...},
-  "total_mappings": 132
-}
-```
+### Issue 4: REST API Does Not Return Breakout Room Names for PMR
 
-**GET /scout/status**
-```json
-{
-  "mapping_complete": true,
-  "rooms_mapped": 132,
-  "meeting_id": "9034027764"
-}
-```
+**Problem:** The Zoom REST API endpoint `/meetings/{id}/breakout_rooms` returns 404 for Personal Meeting Rooms (PMR).
 
-### Calibration Endpoints
+**Impact:** Cannot get room names via REST API for PMR meetings.
 
-**POST /calibration/start**
-```json
-{
-  "meeting_id": "9034027764",
-  "meeting_uuid": "abc123..."
-}
-```
+**Solution:** Must use Zoom Apps SDK (runs inside the meeting) to get room names via `getBreakoutRoomList()`.
 
-**POST /calibration/mapping**
-```json
-{
-  "meeting_id": "9034027764",
-  "room_mapping": [
-    { "room_uuid": "{E7F123FC-...}", "room_name": "1.1:It's Accrual World" }
-  ]
-}
-```
+### Summary: Why Physical Room Entry is Required
+
+| What We Need | How We Get It | Limitation |
+|--------------|---------------|------------|
+| Room Names | SDK `getBreakoutRoomList()` | Only works inside meeting |
+| SDK UUIDs | SDK `getBreakoutRoomList()` | Different format than webhooks |
+| Webhook UUIDs | Webhook events | Only fires when someone enters room |
+| UUID Mapping | Scout Bot enters each room | Must click "Join" manually |
+
+**Bottom Line:** There is no way to automatically map webhook UUIDs to room names without someone physically entering each room. This is a Zoom platform limitation, not a bug in our code.
 
 ---
 
 ## Troubleshooting
 
-### "Webhook validation failed"
-- Check `ZOOM_WEBHOOK_SECRET` matches Zoom App's Secret Token
-- Ensure ngrok is running and URL is updated in Zoom App
+### Room names show as "Room-XXXXXXXX"
+- Webhook calibration not completed
+- Run calibration with Scout Bot clicking "Join" on each popup
+- Verify with: `SELECT source, COUNT(*) FROM room_mappings WHERE mapping_date = CURRENT_DATE() GROUP BY source`
+- Must see both `zoom_sdk_app` AND `webhook_calibration` sources
 
-### "Scout Bot not found"
-- Ensure participant named "Scout Bot" is in the meeting
-- Check browser console (F12) for participant list debug logs
-- The bot name matching is case-insensitive and partial
+### Calibration too fast / missing rooms
+- Adjust `MOVE_DELAY_MS` in `breakout-calibrator/src/services/zoomService.js`
+- Current setting: 10000ms (10 seconds)
 
-### "Bot not moving to rooms"
-- Verify you're the host or co-host
-- Ensure breakout rooms are **OPEN** (not just created)
-- Check browser console for SDK error messages
-- Try "Move Myself" mode if host-based movement fails
+### Webhook validation failed
+- Check `ZOOM_WEBHOOK_SECRET` matches Zoom Marketplace
+- Update via: `gcloud run services update breakout-room-calibrator --set-env-vars "ZOOM_WEBHOOK_SECRET=your-secret"`
 
-### "SDK UUID doesn't match webhook UUID"
-- This is expected behavior - Zoom uses different UUID formats internally
-- Use **room NAMES** as the common key for matching
-- The system stores both formats for flexibility
-
-### "Mappings lost after server restart"
-- Currently mappings are stored in memory only
-- Re-run calibration after restarting the server
-- Future enhancement: persist to file or database
-
----
-
-## Zoom SDK Methods Used
-
-| Method | Purpose | Who Can Use |
-|--------|---------|-------------|
-| `getBreakoutRoomList()` | Get all rooms with names and UUIDs | Any participant |
-| `getMeetingParticipants()` | Get all participants with their UUIDs | Any participant |
-| `assignParticipantToBreakoutRoom()` | Move another participant to a room | Host/Co-host only |
-| `changeBreakoutRoom()` | Move yourself to a room | Any participant |
-
----
-
-## Webhook Events Captured
-
-| Event | Data |
-|-------|------|
-| `meeting.participant_joined_breakout_room` | participant_id, room_uuid, timestamp |
-| `meeting.participant_left_breakout_room` | participant_id, room_uuid, timestamp |
-| `meeting.participant_joined` | participant_id, user_name, email |
-| `meeting.participant_left` | participant_id, leave_reason |
-
----
-
-## Cloud Deployment (Optional)
-
-For production use, deploy to Google Cloud Run:
-
+### Check logs
 ```bash
-# Build and push to Artifact Registry
-gcloud builds submit --tag us-central1-docker.pkg.dev/YOUR_PROJECT/zoom-tracker/webhook:latest
-
-# Deploy to Cloud Run
-gcloud run deploy zoom-webhook \
-  --image us-central1-docker.pkg.dev/YOUR_PROJECT/zoom-tracker/webhook:latest \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --port 8080 \
-  --set-env-vars "ZOOM_WEBHOOK_SECRET=your-secret,GCP_PROJECT_ID=your-project"
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
 ```
 
-See `bigquery_setup.sql` for BigQuery table schemas.
+## Key Files
 
----
-
-## Future Enhancements
-
-1. **Persist mappings** - Save to file/database for survival across restarts
-2. **QoS data capture** - Add participant quality metrics (camera, audio)
-3. **Auto-recalibration** - Detect when rooms change and re-map automatically
-4. **Report generation** - Generate daily attendance reports with room names
-
----
-
-## License
-
-MIT License
+| File | Purpose |
+|------|---------|
+| `app.py` | Main server - webhooks, calibration, API |
+| `breakout-calibrator/src/services/zoomService.js` | Calibration timing (MOVE_DELAY_MS) |
+| `breakout-calibrator/src/hooks/useZoomSdk.js` | Zoom SDK integration |
+| `breakout-calibrator/src/components/CalibrationPanel.jsx` | Calibration UI |
+| `attendance_report_with_room_names.sql` | Report query |
+| `bigquery_schemas.sql` | Table definitions |
