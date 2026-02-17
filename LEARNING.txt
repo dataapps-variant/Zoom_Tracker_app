@@ -1,0 +1,287 @@
+================================================================================
+ZOOM BREAKOUT ROOM TRACKER - LEARNING COMMANDS REFERENCE
+================================================================================
+All commands used for GCP, BigQuery, Cloud Run, and deployment.
+
+================================================================================
+GOOGLE CLOUD SDK SETUP
+================================================================================
+
+# Install Google Cloud SDK (download from https://cloud.google.com/sdk/docs/install)
+
+# Login to Google Cloud
+gcloud auth login
+
+# Set default project
+gcloud config set project variant-finance-data-project
+
+# List projects
+gcloud projects list
+
+# Check current configuration
+gcloud config list
+
+================================================================================
+BIGQUERY COMMANDS
+================================================================================
+
+# Create a dataset
+bq mk --dataset variant-finance-data-project:breakout_room_calibrator
+
+# List datasets
+bq ls
+
+# List tables in a dataset
+bq ls breakout_room_calibrator
+
+# Create table from schema file (run SQL in BigQuery Console or use bq)
+# See bigquery_schemas.sql for table definitions
+
+# Query data from command line
+bq query --use_legacy_sql=false "SELECT COUNT(*) FROM \`variant-finance-data-project.breakout_room_calibrator.participant_events\`"
+
+# Query with date filter
+bq query --use_legacy_sql=false "SELECT * FROM \`variant-finance-data-project.breakout_room_calibrator.room_mappings\` WHERE mapping_date = CURRENT_DATE() LIMIT 10"
+
+# Check table schema
+bq show --schema variant-finance-data-project:breakout_room_calibrator.participant_events
+
+# Delete a table
+bq rm -f variant-finance-data-project:breakout_room_calibrator.table_name
+
+# Export table to CSV
+bq extract --destination_format CSV variant-finance-data-project:breakout_room_calibrator.participant_events gs://bucket-name/export.csv
+
+================================================================================
+CLOUD RUN DEPLOYMENT
+================================================================================
+
+# Deploy from source (builds container automatically)
+gcloud run deploy breakout-room-calibrator \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated
+
+# Deploy with environment variables
+gcloud run deploy breakout-room-calibrator \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-env-vars "GCP_PROJECT_ID=variant-finance-data-project,BQ_DATASET=breakout_room_calibrator,SCOUT_BOT_NAME=Scout Bot"
+
+# Update environment variables only (no redeploy)
+gcloud run services update breakout-room-calibrator \
+  --region us-central1 \
+  --set-env-vars "ZOOM_WEBHOOK_SECRET=your-secret"
+
+# List deployed services
+gcloud run services list
+
+# Get service URL
+gcloud run services describe breakout-room-calibrator --region us-central1 --format="value(status.url)"
+
+# View service details
+gcloud run services describe breakout-room-calibrator --region us-central1
+
+# Delete a service
+gcloud run services delete breakout-room-calibrator --region us-central1
+
+================================================================================
+CLOUD RUN LOGS
+================================================================================
+
+# View recent logs
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 100
+
+# Stream logs in real-time
+gcloud run services logs tail breakout-room-calibrator --region us-central1
+
+# Filter logs by text
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 200 | grep "Scout"
+
+# View logs with timestamp
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=breakout-room-calibrator" --limit 50
+
+================================================================================
+DOCKER COMMANDS (Local Testing)
+================================================================================
+
+# Build Docker image
+docker build -t zoom-tracker .
+
+# Run container locally
+docker run -p 8080:8080 -e GCP_PROJECT_ID=variant-finance-data-project zoom-tracker
+
+# List running containers
+docker ps
+
+# Stop container
+docker stop <container_id>
+
+# View container logs
+docker logs <container_id>
+
+# Remove all stopped containers
+docker container prune
+
+================================================================================
+REACT APP (breakout-calibrator)
+================================================================================
+
+# Navigate to React app directory
+cd breakout-calibrator
+
+# Install dependencies
+npm install
+
+# Run development server (localhost:3000)
+npm start
+
+# Build production version
+npm run build
+
+# The build/ folder is served by Flask at /app endpoint
+
+================================================================================
+GIT COMMANDS
+================================================================================
+
+# Check status
+git status
+
+# Stage all changes (including deletions)
+git add -A
+
+# Stage specific file
+git add filename.py
+
+# Commit changes
+git commit -m "Your commit message"
+
+# Push to GitHub
+git push origin main
+
+# Pull latest changes
+git pull origin main
+
+# View commit history
+git log --oneline -10
+
+# Discard local changes
+git checkout -- filename.py
+
+# View remote URL
+git remote -v
+
+================================================================================
+CURL COMMANDS (API Testing)
+================================================================================
+
+# Health check
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/health
+
+# Test BigQuery connection
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/bigquery
+
+# Get room mappings
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/mappings
+
+# Get calibration status
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/calibration/status
+
+# Test webhook (POST)
+curl -X POST https://breakout-room-calibrator-1041741270489.us-central1.run.app/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"event": "test"}'
+
+# Debug state
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/debug/state
+
+================================================================================
+BIGQUERY SQL QUERIES (Run in BigQuery Console)
+================================================================================
+
+-- Check mapping sources
+SELECT source, COUNT(*) as count
+FROM `variant-finance-data-project.breakout_room_calibrator.room_mappings`
+WHERE mapping_date = CURRENT_DATE()
+GROUP BY source;
+
+-- View recent participant events
+SELECT participant_name, event_type, room_name, event_timestamp
+FROM `variant-finance-data-project.breakout_room_calibrator.participant_events`
+WHERE event_date = CURRENT_DATE()
+ORDER BY event_timestamp DESC
+LIMIT 50;
+
+-- View room mappings
+SELECT room_name, room_uuid, source, mapped_at
+FROM `variant-finance-data-project.breakout_room_calibrator.room_mappings`
+WHERE mapping_date = CURRENT_DATE()
+ORDER BY room_name;
+
+-- Full attendance report (see attendance_report_with_room_names.sql)
+
+-- Count records per table
+SELECT 'participant_events' as table_name, COUNT(*) as count FROM `variant-finance-data-project.breakout_room_calibrator.participant_events`
+UNION ALL
+SELECT 'room_mappings', COUNT(*) FROM `variant-finance-data-project.breakout_room_calibrator.room_mappings`
+UNION ALL
+SELECT 'camera_events', COUNT(*) FROM `variant-finance-data-project.breakout_room_calibrator.camera_events`
+UNION ALL
+SELECT 'qos_data', COUNT(*) FROM `variant-finance-data-project.breakout_room_calibrator.qos_data`;
+
+================================================================================
+SECRETS MANAGEMENT
+================================================================================
+
+# Create a secret
+echo -n "your-secret-value" | gcloud secrets create ZOOM_WEBHOOK_SECRET --data-file=-
+
+# Add new version to existing secret
+echo -n "new-secret-value" | gcloud secrets versions add ZOOM_WEBHOOK_SECRET --data-file=-
+
+# View secret (latest version)
+gcloud secrets versions access latest --secret=ZOOM_WEBHOOK_SECRET
+
+# List secrets
+gcloud secrets list
+
+# Delete a secret
+gcloud secrets delete ZOOM_WEBHOOK_SECRET
+
+================================================================================
+USEFUL WORKFLOW
+================================================================================
+
+# Full deployment workflow:
+cd C:\Users\shash\Downloads\zoom+tracker
+cd breakout-calibrator && npm run build && cd ..
+gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated
+
+# Quick log check:
+gcloud run services logs read breakout-room-calibrator --region us-central1 --limit 50
+
+# Verify deployment:
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/health
+
+# Check BigQuery data:
+curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/bigquery
+
+================================================================================
+ZOOM MARKETPLACE URLS (Current)
+================================================================================
+
+Cloud Run Service URL:
+https://breakout-room-calibrator-1041741270489.us-central1.run.app
+
+Zoom App Home URL:
+https://breakout-room-calibrator-1041741270489.us-central1.run.app/app
+
+Zoom App OAuth Redirect URL:
+https://breakout-room-calibrator-1041741270489.us-central1.run.app/app
+
+Webhook URL:
+https://breakout-room-calibrator-1041741270489.us-central1.run.app/webhook
+
+================================================================================
