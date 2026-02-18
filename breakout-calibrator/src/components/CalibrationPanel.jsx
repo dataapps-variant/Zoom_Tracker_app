@@ -66,8 +66,12 @@ function CalibrationPanel() {
       const meetingUUID = await getMeetingUUID();
       const meetingId = meetingContext?.meetingID;
 
+      // Store meeting info for use in callbacks
+      const meetingInfo = { meetingId, meetingUUID };
+
       // Notify backend
       await notifyCalibrationStart(meetingId, meetingUUID);
+      setDebugLogs(prev => [...prev, `Notified backend: calibration started`]);
 
       // Fetch rooms first to show in UI
       const breakoutRooms = await getBreakoutRooms();
@@ -91,13 +95,13 @@ function CalibrationPanel() {
 
       setUiState(UI_STATES.CALIBRATING);
 
-      // Run calibration
+      // Run calibration with BEFORE-MOVE mapping notification
       const result = await runCalibration({
         getBreakoutRooms,
         getParticipants,
         moveParticipantToRoom,
         moveToMainRoom,
-        onProgress: (progress) => {
+        onProgress: async (progress) => {
           setStatusMessage(progress.message);
           if (progress.currentRoom !== undefined) {
             setCurrentRoom(progress.currentRoom - 1);
@@ -107,12 +111,29 @@ function CalibrationPanel() {
             setDebugLogs(prev => [...prev, `BOT FOUND: ${progress.message}`]);
             setDebugLogs(prev => [...prev, `BOT UUID: ${progress.botId}`]);
           }
-          // Log first move attempt with full details
-          if (progress.step === 'moving_to_room' && progress.currentRoom === 1) {
-            setDebugLogs(prev => [...prev, `FIRST MOVE: ${progress.message}`]);
-            setDebugLogs(prev => [...prev, `CALLING SDK WITH:`]);
-            setDebugLogs(prev => [...prev, `  participantUUID: ${progress.botUUID}`]);
-            setDebugLogs(prev => [...prev, `  breakoutRoomUUID: ${progress.roomUUID}`]);
+          // CRITICAL FIX: Send mapping to backend BEFORE moving Scout Bot
+          // This tells the backend which room Scout Bot is about to enter
+          if (progress.step === 'moving_to_room') {
+            const mapping = {
+              roomUUID: progress.roomUUID,
+              roomName: progress.roomName,
+              roomIndex: progress.currentRoom - 1,
+              timestamp: new Date().toISOString()
+            };
+            try {
+              await sendRoomMapping(meetingInfo.meetingId, meetingInfo.meetingUUID, [mapping]);
+              setDebugLogs(prev => [...prev, `SENT MAPPING BEFORE MOVE: ${progress.roomName}`]);
+            } catch (err) {
+              setDebugLogs(prev => [...prev, `WARNING: Failed to send mapping: ${err.message}`]);
+            }
+
+            // Log first move attempt with full details
+            if (progress.currentRoom === 1) {
+              setDebugLogs(prev => [...prev, `FIRST MOVE: ${progress.message}`]);
+              setDebugLogs(prev => [...prev, `CALLING SDK WITH:`]);
+              setDebugLogs(prev => [...prev, `  participantUUID: ${progress.botUUID}`]);
+              setDebugLogs(prev => [...prev, `  breakoutRoomUUID: ${progress.roomUUID}`]);
+            }
           }
           // Log first room mapped (SDK response)
           if (progress.step === 'room_mapped' && progress.currentRoom === 1) {
@@ -124,13 +145,9 @@ function CalibrationPanel() {
         }
       });
 
-      // Send mappings to backend
-      if (result.roomMapping.length > 0) {
-        await sendRoomMapping(meetingId, meetingUUID, result.roomMapping);
-      }
-
-      // Notify completion
+      // Notify completion (mappings already sent before each move)
       await notifyCalibrationComplete(meetingId, meetingUUID, result);
+      setDebugLogs(prev => [...prev, `Notified backend: calibration complete`]);
 
       setUiState(UI_STATES.COMPLETE);
       setStatusMessage(`Successfully mapped ${result.mappedRooms} of ${result.totalRooms} rooms`);

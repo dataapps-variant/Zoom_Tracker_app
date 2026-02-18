@@ -1,14 +1,14 @@
 """
-DAILY REPORT GENERATOR
-======================
-Generates detailed attendance reports with:
-- Participant attendance times
-- Camera ON/OFF exact times and durations
-- Room visit history
-- QoS data
-- CSV export support
+DAILY ATTENDANCE REPORT GENERATOR
+=================================
+Generates CSV report with ONE ROW PER PARTICIPANT
+All times in IST (Indian Standard Time)
 
-Triggered by Cloud Scheduler daily at 9:15 AM
+Format:
+- Name, Email, Main Join IST, Main Left IST, Camera On, Camera Off
+- Room History: RoomName [JoinTime-LeaveTime Duration] | NextRoom [...]
+
+Triggered by Cloud Scheduler daily or /generate-report endpoint
 """
 
 from google.cloud import bigquery
@@ -29,10 +29,10 @@ except ImportError:
     print("[ReportGenerator] SendGrid not installed - email disabled")
 
 # Configuration
-GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', '')
+GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', 'variant-finance-data-project')
 BQ_DATASET = os.environ.get('BQ_DATASET', 'breakout_room_calibrator')
 SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
-REPORT_EMAIL_FROM = os.environ.get('REPORT_EMAIL_FROM', 'reports@yourdomain.com')
+REPORT_EMAIL_FROM = os.environ.get('REPORT_EMAIL_FROM', 'reports@verveadvisory.com')
 REPORT_EMAIL_TO = os.environ.get('REPORT_EMAIL_TO', '')
 
 
@@ -43,7 +43,8 @@ def get_bq_client():
 
 def generate_daily_report(report_date=None):
     """
-    Generate complete daily attendance report
+    Generate daily attendance report with ONE ROW PER PARTICIPANT
+    All times in IST (UTC + 5:30)
 
     Args:
         report_date: Date string 'YYYY-MM-DD' (defaults to yesterday)
@@ -60,360 +61,195 @@ def generate_daily_report(report_date=None):
     client = get_bq_client()
 
     # =============================================
-    # 1. PARTICIPANT SUMMARY
+    # MAIN QUERY - ONE ROW PER PARTICIPANT
+    # With room history, all times in IST
     # =============================================
-    summary_query = f"""
-    WITH participant_events AS (
-        SELECT
-            participant_id,
-            participant_name,
-            participant_email,
-            event_type,
-            event_timestamp,
-            room_name,
-            LEAD(event_timestamp) OVER (
-                PARTITION BY participant_id
-                ORDER BY event_timestamp
-            ) AS next_event_time
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-        WHERE event_date = '{report_date}'
+    main_query = f"""
+    WITH participant_main AS (
+      SELECT
+        participant_email,
+        participant_name,
+        MIN(CASE WHEN event_type = 'participant_joined' THEN event_timestamp END) as joined_utc,
+        MAX(CASE WHEN event_type = 'participant_left' THEN event_timestamp END) as left_utc
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+      WHERE event_date = '{report_date}'
+      GROUP BY participant_email, participant_name
     ),
-    attendance AS (
-        SELECT
-            participant_id,
-            participant_name,
-            participant_email,
-            MIN(event_timestamp) AS first_join,
-            MAX(event_timestamp) AS last_activity,
-            COUNT(DISTINCT CASE WHEN event_type LIKE '%joined%' THEN event_timestamp END) AS join_count,
-            STRING_AGG(DISTINCT room_name, ', ' ORDER BY room_name) AS rooms_visited
-        FROM participant_events
-        GROUP BY 1, 2, 3
+    room_joins AS (
+      SELECT
+        pe.participant_email,
+        pe.participant_name,
+        COALESCE(rm.room_name, pe.room_name) as room_name,
+        pe.event_timestamp as join_time,
+        pe.room_uuid
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events` pe
+      LEFT JOIN `{GCP_PROJECT_ID}.{BQ_DATASET}.room_mappings` rm
+        ON pe.room_uuid LIKE CONCAT(SUBSTR(rm.room_uuid, 1, 8), '%')
+        AND rm.source = 'webhook_calibration'
+        AND rm.mapping_date = pe.event_date
+      WHERE pe.event_date = '{report_date}'
+        AND pe.event_type = 'breakout_room_joined'
+    ),
+    room_leaves AS (
+      SELECT
+        participant_email,
+        participant_name,
+        room_uuid,
+        MIN(event_timestamp) as leave_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
+      WHERE event_date = '{report_date}'
+        AND event_type = 'breakout_room_left'
+      GROUP BY participant_email, participant_name, room_uuid
+    ),
+    camera_on AS (
+      SELECT
+        participant_email,
+        participant_name,
+        MIN(event_timestamp) as cam_on_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
+      WHERE event_date = '{report_date}' AND camera_on = true
+      GROUP BY participant_email, participant_name
+    ),
+    camera_off AS (
+      SELECT
+        participant_email,
+        participant_name,
+        MAX(event_timestamp) as cam_off_time
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
+      WHERE event_date = '{report_date}' AND camera_on = false
+      GROUP BY participant_email, participant_name
+    ),
+    room_visits AS (
+      SELECT
+        rj.participant_email,
+        rj.participant_name,
+        rj.room_name,
+        -- Convert to IST (UTC + 5:30 = 330 minutes)
+        SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rj.join_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as join_ist,
+        SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rl.leave_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as leave_ist,
+        ROUND(TIMESTAMP_DIFF(
+          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rl.leave_time),
+          PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', rj.join_time),
+          MINUTE
+        ), 0) as duration_mins,
+        rj.join_time as sort_time
+      FROM room_joins rj
+      LEFT JOIN room_leaves rl
+        ON rj.participant_email = rl.participant_email
+        AND rj.participant_name = rl.participant_name
+        AND rj.room_uuid = rl.room_uuid
+        AND rl.leave_time > rj.join_time
+    ),
+    room_history AS (
+      SELECT
+        participant_email,
+        participant_name,
+        STRING_AGG(
+          CONCAT(room_name, ' [', COALESCE(join_ist,'?'), '-', COALESCE(leave_ist,'?'), ' ', CAST(COALESCE(duration_mins,0) AS STRING), 'min]'),
+          ' | ' ORDER BY sort_time
+        ) as rooms
+      FROM room_visits
+      GROUP BY participant_email, participant_name
     )
     SELECT
-        participant_id,
-        participant_name,
-        participant_email,
-        first_join,
-        last_activity,
-        TIMESTAMP_DIFF(
-            SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', SUBSTR(last_activity, 1, 19)),
-            SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', SUBSTR(first_join, 1, 19)),
-            MINUTE
-        ) AS total_duration_minutes,
-        join_count,
-        rooms_visited
-    FROM attendance
-    ORDER BY participant_name
+      pm.participant_name as Name,
+      pm.participant_email as Email,
+      -- Main room times in IST
+      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.joined_utc), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Main_Joined_IST,
+      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.left_utc), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Main_Left_IST,
+      -- Total duration
+      ROUND(TIMESTAMP_DIFF(
+        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.left_utc),
+        PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.joined_utc),
+        MINUTE
+      ), 0) as Total_Duration_Min,
+      -- Camera times in IST
+      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', con.cam_on_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Camera_On_IST,
+      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', coff.cam_off_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Camera_Off_IST,
+      -- Room history
+      COALESCE(rh.rooms, '-') as Room_History
+    FROM participant_main pm
+    LEFT JOIN room_history rh
+      ON pm.participant_email = rh.participant_email
+      AND pm.participant_name = rh.participant_name
+    LEFT JOIN camera_on con
+      ON pm.participant_email = con.participant_email
+      AND pm.participant_name = con.participant_name
+    LEFT JOIN camera_off coff
+      ON pm.participant_email = coff.participant_email
+      AND pm.participant_name = coff.participant_name
+    WHERE pm.participant_name NOT LIKE '%Scout%'
+    ORDER BY pm.participant_name
     """
 
     try:
-        summary_results = list(client.query(summary_query).result())
+        results = list(client.query(main_query).result())
+        print(f"[Report] Query returned {len(results)} participants")
     except Exception as e:
-        print(f"[Report] Summary query error: {e}")
-        summary_results = []
-
-    # =============================================
-    # 2. CAMERA ON/OFF DETAILS
-    # =============================================
-    camera_query = f"""
-    SELECT
-        participant_id,
-        participant_name,
-        participant_email,
-        event_type,
-        event_timestamp,
-        event_time,
-        room_name,
-        duration_seconds,
-        camera_on
-    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
-    WHERE event_date = '{report_date}'
-    ORDER BY participant_name, event_timestamp
-    """
-
-    try:
-        camera_results = list(client.query(camera_query).result())
-    except Exception as e:
-        print(f"[Report] Camera query error: {e}")
-        camera_results = []
-
-    # =============================================
-    # 3. CAMERA DURATION SUMMARY
-    # =============================================
-    camera_summary_query = f"""
-    SELECT
-        participant_name,
-        participant_email,
-        SUM(CASE WHEN duration_seconds IS NOT NULL THEN duration_seconds ELSE 0 END) AS total_camera_on_seconds,
-        COUNT(CASE WHEN camera_on = TRUE THEN 1 END) AS camera_on_count,
-        COUNT(CASE WHEN camera_on = FALSE THEN 1 END) AS camera_off_count,
-        MIN(CASE WHEN camera_on = TRUE THEN event_time END) AS first_camera_on,
-        MAX(CASE WHEN camera_on = FALSE THEN event_time END) AS last_camera_off
-    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.camera_events`
-    WHERE event_date = '{report_date}'
-    GROUP BY participant_name, participant_email
-    ORDER BY participant_name
-    """
-
-    try:
-        camera_summary = list(client.query(camera_summary_query).result())
-    except Exception as e:
-        print(f"[Report] Camera summary error: {e}")
-        camera_summary = []
-
-    # =============================================
-    # 4. ROOM VISIT HISTORY
-    # =============================================
-    room_history_query = f"""
-    WITH room_visits AS (
-        SELECT
-            participant_id,
-            participant_name,
-            participant_email,
-            room_name,
-            event_type,
-            event_timestamp,
-            LEAD(event_timestamp) OVER (
-                PARTITION BY participant_id
-                ORDER BY event_timestamp
-            ) AS next_event_time
-        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.participant_events`
-        WHERE event_date = '{report_date}'
-            AND room_name IS NOT NULL
-            AND room_name != ''
-    )
-    SELECT
-        participant_id,
-        participant_name,
-        participant_email,
-        room_name,
-        MIN(event_timestamp) AS entered_at,
-        MAX(COALESCE(next_event_time, event_timestamp)) AS left_at,
-        GREATEST(1, TIMESTAMP_DIFF(
-            SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', SUBSTR(MAX(COALESCE(next_event_time, event_timestamp)), 1, 19)),
-            SAFE.PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%S', SUBSTR(MIN(event_timestamp), 1, 19)),
-            MINUTE
-        )) AS duration_minutes
-    FROM room_visits
-    WHERE event_type LIKE '%joined%'
-    GROUP BY participant_id, participant_name, participant_email, room_name
-    ORDER BY participant_name, entered_at
-    """
-
-    try:
-        room_history = list(client.query(room_history_query).result())
-    except Exception as e:
-        print(f"[Report] Room history error: {e}")
-        room_history = []
-
-    # =============================================
-    # 5. QOS DATA
-    # =============================================
-    qos_query = f"""
-    SELECT
-        participant_name,
-        participant_email,
-        join_time,
-        leave_time,
-        duration_minutes,
-        attentiveness_score
-    FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.qos_data`
-    WHERE event_date = '{report_date}'
-    ORDER BY participant_name
-    """
-
-    try:
-        qos_results = list(client.query(qos_query).result())
-    except Exception as e:
-        print(f"[Report] QoS query error: {e}")
-        qos_results = []
+        print(f"[Report] Query error: {e}")
+        results = []
 
     # =============================================
     # BUILD REPORT OBJECT
     # =============================================
-
-    # Convert BigQuery rows to dicts
-    def row_to_dict(row):
-        return dict(row.items())
-
     report = {
         'report_date': report_date,
         'generated_at': datetime.utcnow().isoformat(),
-        'summary': {
-            'total_participants': len(summary_results),
-            'participants': [row_to_dict(r) for r in summary_results]
-        },
-        'camera_details': [row_to_dict(r) for r in camera_results],
-        'camera_summary': [row_to_dict(r) for r in camera_summary],
-        'room_history': [row_to_dict(r) for r in room_history],
-        'qos_data': [row_to_dict(r) for r in qos_results]
+        'total_participants': len(results),
+        'participants': [dict(row.items()) for row in results]
     }
 
-    # Generate CSV files
-    report['csv_files'] = generate_csv_files(report)
+    # Generate CSV
+    report['csv_content'] = generate_csv(report)
 
-    print(f"[Report] Generated report with {len(summary_results)} participants")
+    print(f"[Report] Generated report with {len(results)} participants")
     return report
 
 
-def generate_csv_files(report):
-    """Generate single consolidated timeline report CSV"""
-    csv_files = {}
-
-    # SINGLE CONSOLIDATED TIMELINE REPORT
-    # Shows complete journey for each participant with camera status per room
-    timeline_output = io.StringIO()
-    timeline_writer = csv.writer(timeline_output)
+def generate_csv(report):
+    """Generate CSV content from report data"""
+    output = io.StringIO()
+    writer = csv.writer(output)
 
     # Header
-    timeline_writer.writerow([
-        'Participant Name',
+    writer.writerow([
+        'Name',
         'Email',
-        'Participant ID',
-        'Meeting Join Time',
-        'Meeting Leave Time',
-        'Total Duration (min)',
-        'Room Name',
-        'Room Entry Time',
-        'Room Exit Time',
-        'Room Duration (min)',
-        'Camera ON Time',
-        'Camera OFF Time',
-        'Camera ON Duration (sec)',
-        'Next Room'
+        'Main_Joined_IST',
+        'Main_Left_IST',
+        'Total_Duration_Min',
+        'Camera_On_IST',
+        'Camera_Off_IST',
+        'Room_History'
     ])
 
-    # Build participant timeline from all events
-    participant_data = {}
+    # Data rows
+    for p in report['participants']:
+        writer.writerow([
+            p.get('Name', '') or '',
+            p.get('Email', '') or '',
+            p.get('Main_Joined_IST', '') or '',
+            p.get('Main_Left_IST', '') or '',
+            p.get('Total_Duration_Min', '') or '',
+            p.get('Camera_On_IST', '') or '',
+            p.get('Camera_Off_IST', '') or '',
+            p.get('Room_History', '-') or '-'
+        ])
 
-    # Step 1: Gather all participant info from summary
-    for p in report['summary']['participants']:
-        pid = p.get('participant_name', '')
-        participant_data[pid] = {
-            'name': p.get('participant_name', ''),
-            'email': p.get('participant_email', ''),
-            'participant_id': p.get('participant_id', ''),
-            'meeting_join': p.get('first_join', ''),
-            'meeting_leave': p.get('last_activity', ''),
-            'total_duration': p.get('total_duration_minutes', 0) or 0,
-            'room_visits': [],  # List of room visit records
-            'camera_events': []  # List of camera events
-        }
-
-    # Step 2: Add room visit data
-    for r in report['room_history']:
-        name = r.get('participant_name', '')
-        if name in participant_data:
-            if not participant_data[name]['participant_id'] and r.get('participant_id'):
-                participant_data[name]['participant_id'] = r.get('participant_id', '')
-            participant_data[name]['room_visits'].append({
-                'room_name': r.get('room_name', ''),
-                'entry_time': r.get('entered_at', ''),
-                'exit_time': r.get('left_at', ''),
-                'duration': r.get('duration_minutes', 0)
-            })
-
-    # Step 3: Add camera events
-    for c in report['camera_details']:
-        name = c.get('participant_name', '')
-        if name in participant_data:
-            if not participant_data[name]['participant_id'] and c.get('participant_id'):
-                participant_data[name]['participant_id'] = c.get('participant_id', '')
-            participant_data[name]['camera_events'].append({
-                'event_type': c.get('event_type', ''),
-                'event_time': c.get('event_time', ''),
-                'room_name': c.get('room_name', ''),
-                'camera_on': c.get('camera_on', False),
-                'duration_seconds': c.get('duration_seconds', 0)
-            })
-
-    # Step 4: Build timeline rows
-    for name, data in sorted(participant_data.items()):
-        room_visits = data['room_visits']
-        camera_events = data['camera_events']
-
-        if not room_visits:
-            # No room visits - just main meeting
-            # Find camera events for main room
-            main_camera_on = ''
-            main_camera_off = ''
-            main_camera_duration = 0
-
-            for ce in camera_events:
-                if ce['camera_on']:
-                    if not main_camera_on:
-                        main_camera_on = ce['event_time']
-                else:
-                    main_camera_off = ce['event_time']
-                    main_camera_duration += ce.get('duration_seconds', 0) or 0
-
-            timeline_writer.writerow([
-                data['name'],
-                data['email'],
-                data['participant_id'],
-                data['meeting_join'][:19] if data['meeting_join'] else '',
-                data['meeting_leave'][:19] if data['meeting_leave'] else '',
-                data['total_duration'],
-                'Main Room',
-                data['meeting_join'][:19] if data['meeting_join'] else '',
-                data['meeting_leave'][:19] if data['meeting_leave'] else '',
-                data['total_duration'],
-                main_camera_on,
-                main_camera_off,
-                main_camera_duration,
-                ''
-            ])
-        else:
-            # Has room visits - create row per room
-            for i, room in enumerate(room_visits):
-                # Get next room name
-                next_room = room_visits[i + 1]['room_name'] if i + 1 < len(room_visits) else 'Left Meeting'
-
-                # Find camera events for this room
-                room_camera_on = ''
-                room_camera_off = ''
-                room_camera_duration = 0
-
-                for ce in camera_events:
-                    if ce.get('room_name', '') == room['room_name']:
-                        if ce['camera_on']:
-                            if not room_camera_on:
-                                room_camera_on = ce['event_time']
-                        else:
-                            room_camera_off = ce['event_time']
-                            room_camera_duration += ce.get('duration_seconds', 0) or 0
-
-                timeline_writer.writerow([
-                    data['name'],
-                    data['email'],
-                    data['participant_id'],
-                    data['meeting_join'][:19] if data['meeting_join'] else '',
-                    data['meeting_leave'][:19] if data['meeting_leave'] else '',
-                    data['total_duration'],
-                    room['room_name'],
-                    room['entry_time'][:19] if room['entry_time'] else '',
-                    room['exit_time'][:19] if room['exit_time'] else '',
-                    room['duration'],
-                    room_camera_on,
-                    room_camera_off,
-                    room_camera_duration,
-                    next_room
-                ])
-
-    csv_files['attendance_report.csv'] = timeline_output.getvalue()
-
-    return csv_files
+    return output.getvalue()
 
 
 def send_report_email(report, report_date):
-    """Send report via SendGrid with CSV attachments"""
+    """Send report via SendGrid with CSV attachment"""
     if not SENDGRID_AVAILABLE:
         print("[Report] SendGrid not available")
         return False
 
     if not all([SENDGRID_API_KEY, REPORT_EMAIL_FROM, REPORT_EMAIL_TO]):
         print("[Report] Email configuration incomplete")
+        print(f"  SENDGRID_API_KEY: {'set' if SENDGRID_API_KEY else 'NOT SET'}")
+        print(f"  REPORT_EMAIL_FROM: {REPORT_EMAIL_FROM}")
+        print(f"  REPORT_EMAIL_TO: {REPORT_EMAIL_TO}")
         return False
 
     try:
@@ -426,7 +262,7 @@ def send_report_email(report, report_date):
                 h1 {{ color: #2D8CFF; }}
                 h2 {{ color: #333; border-bottom: 2px solid #2D8CFF; padding-bottom: 5px; }}
                 table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
-                th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; font-size: 12px; }}
                 th {{ background-color: #2D8CFF; color: white; }}
                 tr:nth-child(even) {{ background-color: #f9f9f9; }}
                 .summary {{ background: #f0f8ff; padding: 15px; border-radius: 8px; margin: 20px 0; }}
@@ -436,56 +272,40 @@ def send_report_email(report, report_date):
         <body>
             <h1>Daily Zoom Attendance Report</h1>
             <p><strong>Date:</strong> {report_date}</p>
-            <p><strong>Generated:</strong> {report['generated_at']}</p>
+            <p><strong>Generated:</strong> {report['generated_at']} UTC</p>
+            <p><strong>All times shown in IST (Indian Standard Time)</strong></p>
 
             <div class="summary">
                 <h2>Summary</h2>
-                <p><strong>Total Participants:</strong> {report['summary']['total_participants']}</p>
+                <p><strong>Total Participants:</strong> {report['total_participants']}</p>
             </div>
 
-            <h2>Attendance Summary</h2>
+            <h2>Attendance (First 30 shown, full data in CSV)</h2>
             <table>
                 <tr>
                     <th>Name</th>
                     <th>Email</th>
-                    <th>First Join</th>
-                    <th>Duration (min)</th>
-                    <th>Rooms</th>
+                    <th>Joined IST</th>
+                    <th>Left IST</th>
+                    <th>Duration</th>
+                    <th>Room History</th>
                 </tr>
         """
 
-        for p in report['summary']['participants'][:50]:  # Limit to 50 in email
+        for p in report['participants'][:30]:  # Limit to 30 in email
+            room_history = p.get('Room_History', '-') or '-'
+            # Truncate long room history for email
+            if len(room_history) > 80:
+                room_history = room_history[:80] + '...'
+
             html_content += f"""
                 <tr>
-                    <td>{p.get('participant_name', '')}</td>
-                    <td>{p.get('participant_email', '')}</td>
-                    <td>{p.get('first_join', '')[:19] if p.get('first_join') else ''}</td>
-                    <td>{p.get('total_duration_minutes', '')}</td>
-                    <td>{p.get('rooms_visited', '')[:50]}...</td>
-                </tr>
-            """
-
-        html_content += """
-            </table>
-
-            <h2>Camera Usage Summary</h2>
-            <table>
-                <tr>
-                    <th>Name</th>
-                    <th>Camera ON (min)</th>
-                    <th>ON Count</th>
-                    <th>OFF Count</th>
-                </tr>
-        """
-
-        for c in report['camera_summary'][:50]:
-            total_seconds = c.get('total_camera_on_seconds', 0) or 0
-            html_content += f"""
-                <tr>
-                    <td>{c.get('participant_name', '')}</td>
-                    <td>{round(total_seconds / 60, 2)}</td>
-                    <td>{c.get('camera_on_count', '')}</td>
-                    <td>{c.get('camera_off_count', '')}</td>
+                    <td>{p.get('Name', '')}</td>
+                    <td>{p.get('Email', '')}</td>
+                    <td>{p.get('Main_Joined_IST', '')}</td>
+                    <td>{p.get('Main_Left_IST', '')}</td>
+                    <td>{p.get('Total_Duration_Min', '')} min</td>
+                    <td style="font-size:10px;">{room_history}</td>
                 </tr>
             """
 
@@ -493,11 +313,9 @@ def send_report_email(report, report_date):
             </table>
 
             <div class="footer">
-                <p>Complete attendance data available in the attached CSV file:</p>
-                <ul>
-                    <li><strong>attendance_report.csv</strong> - Complete timeline with all details</li>
-                </ul>
-                <p>CSV includes: Name, Email, ID, Join/Leave times, Room visits, Camera ON/OFF times per room, Next room visited</p>
+                <p><strong>Full attendance data is in the attached CSV file.</strong></p>
+                <p>CSV Format: One row per participant with complete room visit history</p>
+                <p>Room History Format: RoomName [JoinTime-LeaveTime Duration] | NextRoom [...]</p>
                 <p>Generated by Zoom Breakout Room Tracker</p>
             </div>
         </body>
@@ -512,16 +330,16 @@ def send_report_email(report, report_date):
             html_content=html_content
         )
 
-        # Attach CSV files
-        for filename, content in report['csv_files'].items():
-            encoded = base64.b64encode(content.encode()).decode()
-            attachment = Attachment(
-                FileContent(encoded),
-                FileName(f"{report_date}_{filename}"),
-                FileType('text/csv'),
-                Disposition('attachment')
-            )
-            message.add_attachment(attachment)
+        # Attach CSV
+        csv_content = report['csv_content']
+        encoded = base64.b64encode(csv_content.encode('utf-8')).decode()
+        attachment = Attachment(
+            FileContent(encoded),
+            FileName(f"attendance_report_{report_date}.csv"),
+            FileType('text/csv'),
+            Disposition('attachment')
+        )
+        message.add_attachment(attachment)
 
         # Send
         sg = SendGridAPIClient(SENDGRID_API_KEY)
@@ -532,57 +350,63 @@ def send_report_email(report, report_date):
 
     except Exception as e:
         print(f"[Report] Email error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def save_csv_to_gcs(report, report_date, bucket_name):
-    """Save CSV files to Google Cloud Storage"""
+    """Save CSV file to Google Cloud Storage"""
     from google.cloud import storage
 
     try:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
 
-        for filename, content in report['csv_files'].items():
-            blob_path = f"reports/{report_date}/{filename}"
-            blob = bucket.blob(blob_path)
-            blob.upload_from_string(content, content_type='text/csv')
-            print(f"[Report] Saved to GCS: gs://{bucket_name}/{blob_path}")
+        blob_path = f"reports/attendance_report_{report_date}.csv"
+        blob = bucket.blob(blob_path)
+        blob.upload_from_string(report['csv_content'], content_type='text/csv')
 
-        return True
+        print(f"[Report] Saved to GCS: gs://{bucket_name}/{blob_path}")
+        return f"gs://{bucket_name}/{blob_path}"
+
     except Exception as e:
         print(f"[Report] GCS save error: {e}")
-        return False
+        return None
 
 
-# Cloud Function entry point
-def generate_report_http(request):
+# Flask endpoint handler (called from app.py)
+def generate_report_handler(report_date=None):
     """
-    HTTP Cloud Function entry point
-    Triggered by Cloud Scheduler
+    Handler for /generate-report endpoint
+    Returns report data and optionally sends email
     """
-    # Get date from request or use yesterday
-    request_json = request.get_json(silent=True) or {}
-    report_date = request_json.get('date')
-
-    if not report_date:
+    if report_date is None:
+        # Default to yesterday
         report_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
 
     try:
         report = generate_daily_report(report_date)
 
-        # Send email
+        email_sent = False
         if SENDGRID_API_KEY and REPORT_EMAIL_TO:
-            send_report_email(report, report_date)
+            email_sent = send_report_email(report, report_date)
 
         return {
             'success': True,
             'date': report_date,
-            'participants': report['summary']['total_participants']
+            'participants': report['total_participants'],
+            'email_sent': email_sent,
+            'email_to': REPORT_EMAIL_TO if email_sent else None
         }
 
     except Exception as e:
-        return {'error': str(e)}, 500
+        import traceback
+        traceback.print_exc()
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 
 if __name__ == '__main__':
@@ -597,10 +421,15 @@ if __name__ == '__main__':
     print(f"Generating report for {date}...")
     report = generate_daily_report(date)
 
-    # Save CSVs locally for testing
-    for filename, content in report['csv_files'].items():
-        with open(f"test_{filename}", 'w', newline='', encoding='utf-8') as f:
-            f.write(content)
-        print(f"Saved: test_{filename}")
+    # Save CSV locally for testing
+    filename = f"attendance_report_{date}.csv"
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        f.write(report['csv_content'])
+    print(f"Saved: {filename}")
 
-    print(f"\nReport generated with {report['summary']['total_participants']} participants")
+    print(f"\nReport generated with {report['total_participants']} participants")
+
+    # Show first few rows
+    print("\nFirst 5 participants:")
+    for p in report['participants'][:5]:
+        print(f"  {p.get('Name', '')} - {p.get('Main_Joined_IST', '')} to {p.get('Main_Left_IST', '')}")

@@ -29,8 +29,8 @@ ngrok.exe
 node_modules/
 breakout-calibrator/node_modules/
 
-# Build artifacts
-breakout-calibrator/build/
+# Build artifacts (NOT excluded - needed for Cloud Run deployment)
+# breakout-calibrator/build/
 
 # Generated reports (local only)
 reports/

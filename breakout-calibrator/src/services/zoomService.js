@@ -269,7 +269,9 @@ export async function runCalibration({
       console.log('==============================');
     }
 
-    onProgress?.({
+    // CRITICAL: Await onProgress to ensure mapping is sent to backend BEFORE moving
+    // This allows the backend to know which room Scout Bot is about to enter
+    const progressResult = onProgress?.({
       step: 'moving_to_room',
       message: `Moving to room ${i + 1}/${rooms.length}: ${roomName}`,
       currentRoom: i + 1,
@@ -278,6 +280,11 @@ export async function runCalibration({
       roomUUID: roomUUID,
       botUUID: botUUID
     });
+
+    // Wait for async onProgress (mapping notification) to complete
+    if (progressResult && typeof progressResult.then === 'function') {
+      await progressResult;
+    }
 
     console.log(`>>> MOVE CALL: botUUID=${botUUID}, roomUUID=${roomUUID}`);
 
