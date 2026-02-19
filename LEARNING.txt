@@ -269,6 +269,124 @@ curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/health
 curl https://breakout-room-calibrator-1041741270489.us-central1.run.app/test/bigquery
 
 ================================================================================
+CLOUD SCHEDULER (Automated Reports)
+================================================================================
+
+# Create a scheduled job (runs daily at 11:15 AM IST = 5:45 AM UTC)
+gcloud scheduler jobs create http daily-attendance-report \
+  --location=us-central1 \
+  --schedule="45 5 * * *" \
+  --uri="https://breakout-room-calibrator-1041741270489.us-central1.run.app/report/generate" \
+  --http-method=POST \
+  --headers="Content-Type=application/json"
+
+# List scheduled jobs
+gcloud scheduler jobs list --location=us-central1
+
+# Run job manually (trigger now)
+gcloud scheduler jobs run daily-attendance-report --location=us-central1
+
+# Pause a job
+gcloud scheduler jobs pause daily-attendance-report --location=us-central1
+
+# Resume a paused job
+gcloud scheduler jobs resume daily-attendance-report --location=us-central1
+
+# Delete a job
+gcloud scheduler jobs delete daily-attendance-report --location=us-central1
+
+# Update schedule
+gcloud scheduler jobs update http daily-attendance-report \
+  --location=us-central1 \
+  --schedule="15 5 * * *"
+
+================================================================================
+COST OPTIMIZATION
+================================================================================
+
+# Check current Cloud Run settings
+gcloud run services describe breakout-room-calibrator --region us-central1
+
+# Set min instances to 0 (saves ~$15-25/month)
+gcloud run services update breakout-room-calibrator \
+  --min-instances=0 \
+  --region=us-central1
+
+# Reduce memory (saves cost)
+gcloud run services update breakout-room-calibrator \
+  --memory=256Mi \
+  --region=us-central1
+
+# Set concurrency (more efficient)
+gcloud run services update breakout-room-calibrator \
+  --concurrency=80 \
+  --region=us-central1
+
+# Check BigQuery cost (last 30 days)
+bq query --use_legacy_sql=false "
+SELECT
+  ROUND(SUM(total_bytes_billed)/1e9, 2) as total_GB,
+  ROUND(SUM(total_bytes_billed)/1e12 * 6.25, 2) as total_cost_USD
+FROM region-us.INFORMATION_SCHEMA.JOBS
+WHERE creation_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+"
+
+================================================================================
+OTHER WAYS TO DEPLOY (Without Commands)
+================================================================================
+
+1. GOOGLE CLOUD CONSOLE (Web UI)
+   URL: https://console.cloud.google.com/run
+   - Click on your service
+   - Click "EDIT & DEPLOY NEW REVISION"
+   - Upload source or connect to GitHub
+   - Click "Deploy"
+
+2. GITHUB ACTIONS (Automatic on push)
+   - Create .github/workflows/deploy.yml
+   - Connect GitHub repo to Cloud Build
+   - Every push to main triggers deployment
+
+3. CLOUD BUILD TRIGGERS
+   URL: https://console.cloud.google.com/cloud-build/triggers
+   - Create trigger connected to GitHub
+   - Select repo and branch
+   - Auto-deploys on push
+
+4. CLOUD SOURCE REPOSITORIES
+   - Mirror your GitHub repo to Google Cloud
+   - Use Cloud Build for automatic deployment
+
+5. ARTIFACT REGISTRY + DOCKER
+   - Build image locally: docker build -t gcr.io/PROJECT_ID/app .
+   - Push to registry: docker push gcr.io/PROJECT_ID/app
+   - Deploy image: gcloud run deploy --image gcr.io/PROJECT_ID/app
+
+================================================================================
+DEPLOYMENT COMMANDS EXPLAINED
+================================================================================
+
+# Full deployment command:
+gcloud run deploy breakout-room-calibrator --source . --region us-central1 --allow-unauthenticated
+
+# What each part means:
+#   gcloud run deploy        = Deploy to Cloud Run service
+#   breakout-room-calibrator = Name of the service
+#   --source .               = Build from current directory (uses Dockerfile)
+#   --region us-central1     = Deploy to us-central1 region
+#   --allow-unauthenticated  = Anyone can access (no login required)
+
+# Build React app first:
+cd breakout-calibrator && npm run build && cd ..
+
+# What happens during deployment:
+# 1. Uploads source files to Cloud Build
+# 2. Builds Docker image using Dockerfile
+# 3. Pushes image to Artifact Registry
+# 4. Creates new Cloud Run revision
+# 5. Routes 100% traffic to new revision
+
+================================================================================
 ZOOM MARKETPLACE URLS (Current)
 ================================================================================
 

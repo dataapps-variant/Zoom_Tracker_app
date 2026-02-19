@@ -38,14 +38,29 @@ const api = axios.create({
 
 /**
  * Notify backend that calibration is starting
+ * @param {string} meetingId - Meeting ID
+ * @param {string} meetingUUID - Meeting UUID
+ * @param {object} calibrationParticipant - Info about who is doing calibration (optional)
+ * @param {string} calibrationParticipant.name - Participant name
+ * @param {string} calibrationParticipant.participantUUID - Participant UUID
+ * @param {string} calibrationParticipant.mode - 'scout_bot' or 'self'
  */
-export async function notifyCalibrationStart(meetingId, meetingUUID) {
+export async function notifyCalibrationStart(meetingId, meetingUUID, calibrationParticipant = null) {
   try {
-    const response = await api.post('/calibration/start', {
+    const payload = {
       meeting_id: meetingId,
       meeting_uuid: meetingUUID,
       started_at: new Date().toISOString()
-    });
+    };
+
+    // Add calibration participant info if provided
+    if (calibrationParticipant) {
+      payload.calibration_participant_name = calibrationParticipant.name || '';
+      payload.calibration_participant_uuid = calibrationParticipant.participantUUID || '';
+      payload.calibration_mode = calibrationParticipant.mode || 'scout_bot';
+    }
+
+    const response = await api.post('/calibration/start', payload);
     return response.data;
   } catch (err) {
     console.error('Failed to notify calibration start:', err);

@@ -23,6 +23,7 @@ function CalibrationPanel() {
     isConfigured,
     error: sdkError,
     meetingContext,
+    userContext,
     isHost,
     getBreakoutRooms,
     getParticipants,
@@ -69,9 +70,13 @@ function CalibrationPanel() {
       // Store meeting info for use in callbacks
       const meetingInfo = { meetingId, meetingUUID };
 
-      // Notify backend
-      await notifyCalibrationStart(meetingId, meetingUUID);
-      setDebugLogs(prev => [...prev, `Notified backend: calibration started`]);
+      // Notify backend - using Scout Bot mode
+      await notifyCalibrationStart(meetingId, meetingUUID, {
+        mode: 'scout_bot',
+        name: 'Scout Bot',
+        participantUUID: ''  // Will be found during calibration
+      });
+      setDebugLogs(prev => [...prev, `Notified backend: calibration started (Scout Bot mode)`]);
 
       // Fetch rooms first to show in UI
       const breakoutRooms = await getBreakoutRooms();
@@ -193,9 +198,19 @@ function CalibrationPanel() {
       const meetingUUID = await getMeetingUUID();
       const meetingId = meetingContext?.meetingID;
 
-      // Notify backend that calibration is starting
-      await notifyCalibrationStart(meetingId, meetingUUID);
-      setDebugLogs(prev => [...prev, `Notified backend: calibration started`]);
+      // Get current user's info for self-calibration
+      const myName = userContext?.screenName || userContext?.userName || 'Unknown User';
+      const myUUID = userContext?.participantUUID || userContext?.participantId || '';
+
+      setDebugLogs(prev => [...prev, `Self-calibration participant: ${myName} (UUID: ${myUUID})`]);
+
+      // Notify backend that calibration is starting - SELF mode with my info
+      await notifyCalibrationStart(meetingId, meetingUUID, {
+        mode: 'self',
+        name: myName,
+        participantUUID: myUUID
+      });
+      setDebugLogs(prev => [...prev, `Notified backend: calibration started (Self mode: ${myName})`]);
 
       // Get rooms
       const breakoutRooms = await getBreakoutRooms();
@@ -209,8 +224,8 @@ function CalibrationPanel() {
       // Move through each room
       for (let i = 0; i < breakoutRooms.length; i++) {
         const room = breakoutRooms[i];
-        const roomName = room.name || `Room ${i + 1}`;
-        const roomUUID = room.breakoutRoomId || room.uuid;
+        const roomName = room.breakoutRoomName || room.name || `Room ${i + 1}`;
+        const roomUUID = room.breakoutRoomId || room.breakoutRoomUUID || room.uuid;
         const cleanUUID = roomUUID ? roomUUID.replace(/[{}]/g, '') : roomUUID;
 
         setStatusMessage(`Moving to room ${i + 1}/${breakoutRooms.length}: ${roomName}`);
@@ -222,8 +237,13 @@ function CalibrationPanel() {
 
         try {
           // IMPORTANT: Send mapping to backend BEFORE moving
-          // This tells the backend which room Scout Bot is about to enter
-          const mapping = { room_uuid: cleanUUID, room_name: roomName, room_index: i };
+          // This tells the backend which room the calibration participant is about to enter
+          const mapping = {
+            roomUUID: cleanUUID,
+            roomName: roomName,
+            roomIndex: i,
+            timestamp: new Date().toISOString()
+          };
           await sendRoomMapping(meetingId, meetingUUID, [mapping]);
           setDebugLogs(prev => [...prev, `Sent mapping to backend: ${roomName}`]);
 
@@ -260,7 +280,7 @@ function CalibrationPanel() {
       setUiState(UI_STATES.ERROR);
       setCurrentRoom(-1);
     }
-  }, [isConfigured, meetingContext, getMeetingUUID, getBreakoutRooms, changeMyBreakoutRoom]);
+  }, [isConfigured, meetingContext, userContext, getMeetingUUID, getBreakoutRooms, changeMyBreakoutRoom]);
 
   const handleReset = useCallback(() => {
     setUiState(UI_STATES.IDLE);

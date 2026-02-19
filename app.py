@@ -93,6 +93,8 @@ class MeetingState:
     """State for current meeting - resets when new meeting starts"""
 
     def __init__(self):
+        self.previous_meeting_uuid = None  # Store previous meeting for QoS collection
+        self.previous_meeting_id = None
         self.reset()
 
     def reset(self):
@@ -107,6 +109,10 @@ class MeetingState:
         self.scout_bot_current_room = None  # Track current room during calibration
         self.pending_room_moves = []  # Queue of (room_name, timestamp) for Scout Bot moves
         self.calibration_in_progress = False  # Flag to track if calibration is active
+        # Calibration participant info (for "Move Myself" mode)
+        self.calibration_mode = 'scout_bot'  # 'scout_bot' or 'self'
+        self.calibration_participant_name = None  # Name of participant doing calibration
+        self.calibration_participant_uuid = None  # UUID of participant doing calibration
         print("[MeetingState] Reset for new meeting")
 
     def set_meeting(self, meeting_id, meeting_uuid=None):
@@ -115,7 +121,20 @@ class MeetingState:
 
         # Check if this is a new meeting
         if self.meeting_id != meeting_id or self.meeting_date != today:
+            # Store previous meeting info for QoS collection
+            old_uuid = self.meeting_uuid
+            old_id = self.meeting_id
+
             print(f"[MeetingState] New meeting detected: {meeting_id}")
+
+            # Trigger QoS collection for previous meeting (if exists)
+            if old_uuid and old_uuid != meeting_uuid:
+                print(f"[MeetingState] Previous meeting UUID: {old_uuid} - triggering QoS collection")
+                self.previous_meeting_uuid = old_uuid
+                self.previous_meeting_id = old_id
+                # Trigger async QoS collection
+                self._collect_previous_meeting_qos(old_uuid, old_id)
+
             self.reset()
             self.meeting_id = meeting_id
             self.meeting_uuid = meeting_uuid
@@ -126,6 +145,98 @@ class MeetingState:
 
         if meeting_uuid and not self.meeting_uuid:
             self.meeting_uuid = meeting_uuid
+
+    def _collect_previous_meeting_qos(self, meeting_uuid, meeting_id):
+        """Collect QoS data AND camera data for previous meeting in background thread"""
+        def collect_qos_async():
+            print(f"[AutoQoS] Starting automatic QoS + Camera collection for previous meeting: {meeting_uuid}")
+            time.sleep(30)  # Wait 30 seconds for Zoom to finalize data
+
+            collected_count = 0
+            error_count = 0
+
+            # First, collect camera QoS data (Dashboard API - only available shortly after meeting)
+            camera_data_map = {}
+            try:
+                print(f"[AutoQoS] Collecting camera data via Dashboard QoS API...")
+                camera_participants = zoom_api.get_meeting_participants_qos(meeting_id or meeting_uuid)
+                for cp in camera_participants:
+                    user_name = cp.get('user_name', '')
+                    email = cp.get('email', '')
+                    camera_on_count = cp.get('camera_on_count', 0)
+                    # Key by name+email for matching
+                    key = f"{user_name}|{email}".lower()
+                    camera_data_map[key] = camera_on_count
+                print(f"[AutoQoS] Got camera data for {len(camera_data_map)} participants")
+            except Exception as ce:
+                print(f"[AutoQoS] Camera collection error (non-fatal): {ce}")
+
+            try:
+                participants = zoom_api.get_past_meeting_participants(meeting_uuid)
+
+                if not participants and meeting_id:
+                    participants = zoom_api.get_past_meeting_participants(meeting_id)
+
+                if not participants:
+                    print(f"[AutoQoS] No participants found for previous meeting")
+                    return
+
+                print(f"[AutoQoS] Processing {len(participants)} participants from previous meeting...")
+
+                for p in participants:
+                    try:
+                        participant_id = safe_str(
+                            p.get('user_id') or p.get('id') or p.get('participant_user_id'),
+                            default='unknown'
+                        )
+                        participant_name = safe_str(
+                            p.get('name') or p.get('user_name'),
+                            default='Unknown'
+                        )
+                        participant_email = safe_str(
+                            p.get('user_email') or p.get('email'),
+                            default=''
+                        )
+                        duration_seconds = safe_int(p.get('duration', 0))
+                        duration_minutes = duration_seconds // 60 if duration_seconds > 0 else 0
+
+                        # Look up camera data
+                        camera_key = f"{participant_name}|{participant_email}".lower()
+                        camera_on_count = camera_data_map.get(camera_key, 0)
+
+                        qos_data = {
+                            'qos_id': str(uuid_lib.uuid4()),
+                            'meeting_uuid': safe_str(meeting_uuid),
+                            'participant_id': participant_id,
+                            'participant_name': participant_name,
+                            'participant_email': participant_email,
+                            'join_time': safe_str(p.get('join_time', '')),
+                            'leave_time': safe_str(p.get('leave_time', '')),
+                            'duration_minutes': duration_minutes,
+                            'attentiveness_score': str(p.get('attentiveness_score', '')),
+                            'camera_on_count': camera_on_count,
+                            'recorded_at': datetime.utcnow().isoformat(),
+                            'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+                        }
+
+                        if insert_qos_data(qos_data):
+                            collected_count += 1
+                        else:
+                            error_count += 1
+
+                    except Exception as pe:
+                        error_count += 1
+                        print(f"[AutoQoS] Error processing participant: {pe}")
+
+                print(f"[AutoQoS] Collection complete: {collected_count} success, {error_count} errors")
+
+            except Exception as e:
+                print(f"[AutoQoS] Error: {e}")
+                traceback.print_exc()
+
+        thread = threading.Thread(target=collect_qos_async, daemon=True)
+        thread.start()
+        print(f"[AutoQoS] Background thread started for previous meeting QoS")
 
     def _delete_old_mappings(self, date):
         """Delete old mappings from BigQuery for today"""
@@ -501,9 +612,10 @@ class ZoomAPI:
         self.token_expires = now + data.get('expires_in', 3600)
         return self.access_token
 
-    def get_past_meeting_participants(self, meeting_uuid):
+    def get_past_meeting_participants(self, meeting_uuid, page_size=300):
         """
         Get past meeting participants - includes duration and basic QoS
+        NOW WITH PAGINATION SUPPORT - fetches ALL pages
 
         IMPORTANT: Zoom API returns 'duration' in SECONDS, not minutes!
         The caller must convert to minutes if needed.
@@ -523,68 +635,100 @@ class ZoomAPI:
             token = self.get_access_token()
             headers = {'Authorization': f'Bearer {token}'}
 
-            # Build list of URLs to try
-            urls_to_try = []
+            # Build list of URL patterns to try (will add pagination params later)
+            url_patterns = []
 
             # Method 1: Double-encoded UUID (required for UUIDs with / or //)
             encoded_uuid = requests.utils.quote(requests.utils.quote(meeting_uuid, safe=''), safe='')
-            urls_to_try.append(
+            url_patterns.append(
                 (f"https://api.zoom.us/v2/past_meetings/{encoded_uuid}/participants", "past_meetings (double-encoded)")
             )
 
             # Method 2: Single-encoded UUID
             encoded_uuid2 = requests.utils.quote(meeting_uuid, safe='')
             if encoded_uuid2 != encoded_uuid:
-                urls_to_try.append(
+                url_patterns.append(
                     (f"https://api.zoom.us/v2/past_meetings/{encoded_uuid2}/participants", "past_meetings (single-encoded)")
                 )
 
             # Method 3: Raw UUID (for simple meeting IDs)
             if meeting_uuid and not any(c in meeting_uuid for c in ['/', '+', '=']):
-                urls_to_try.append(
+                url_patterns.append(
                     (f"https://api.zoom.us/v2/past_meetings/{meeting_uuid}/participants", "past_meetings (raw)")
                 )
 
             # Method 4: Report API (may have more data, requires Zoom Pro+)
-            urls_to_try.append(
+            url_patterns.append(
                 (f"https://api.zoom.us/v2/report/meetings/{encoded_uuid2}/participants", "report API")
             )
 
-            # Try each method
-            for url, method_name in urls_to_try:
+            # Try each method with pagination
+            for base_url, method_name in url_patterns:
                 try:
-                    print(f"[ZoomAPI] Trying {method_name}...")
-                    response = requests.get(url, headers=headers)
+                    all_participants = []
+                    next_page_token = None
+                    page_count = 0
+                    max_pages = 50  # Safety limit
 
-                    if response.status_code == 200:
-                        data = response.json()
-                        participants = data.get('participants', [])
+                    while page_count < max_pages:
+                        # Build URL with pagination params
+                        params = {'page_size': page_size}
+                        if next_page_token:
+                            params['next_page_token'] = next_page_token
 
-                        if participants:
-                            print(f"[ZoomAPI] SUCCESS via {method_name}: {len(participants)} participants")
+                        print(f"[ZoomAPI] Trying {method_name} (page {page_count + 1})...")
+                        response = requests.get(base_url, headers=headers, params=params)
 
-                            # Log first participant for debugging data structure
+                        if response.status_code == 200:
+                            data = response.json()
+                            participants = data.get('participants', [])
+
                             if participants:
-                                sample = participants[0]
-                                print(f"[ZoomAPI] Sample participant fields: {list(sample.keys())}")
-                                duration = sample.get('duration', 'N/A')
-                                print(f"[ZoomAPI] Sample duration value: {duration} (type: {type(duration).__name__})")
+                                all_participants.extend(participants)
+                                print(f"[ZoomAPI] Page {page_count + 1}: got {len(participants)} participants (total: {len(all_participants)})")
 
-                            return participants
+                                # Check for more pages
+                                next_page_token = data.get('next_page_token', '')
+                                page_count += 1
 
-                    elif response.status_code == 404:
-                        print(f"[ZoomAPI] {method_name}: Meeting not found (404)")
-                    elif response.status_code == 400:
-                        print(f"[ZoomAPI] {method_name}: Bad request (400) - {response.text[:200]}")
-                    elif response.status_code == 401:
-                        print(f"[ZoomAPI] {method_name}: Unauthorized (401) - token may be expired")
-                        # Try refreshing token
-                        self.access_token = None
-                        self.token_expires = 0
-                        token = self.get_access_token()
-                        headers = {'Authorization': f'Bearer {token}'}
-                    else:
-                        print(f"[ZoomAPI] {method_name}: {response.status_code} - {response.text[:200]}")
+                                if not next_page_token:
+                                    # No more pages
+                                    print(f"[ZoomAPI] SUCCESS via {method_name}: {len(all_participants)} total participants")
+
+                                    # Log first participant for debugging
+                                    if all_participants:
+                                        sample = all_participants[0]
+                                        print(f"[ZoomAPI] Sample participant fields: {list(sample.keys())}")
+                                        duration = sample.get('duration', 'N/A')
+                                        print(f"[ZoomAPI] Sample duration value: {duration} (type: {type(duration).__name__})")
+
+                                    return all_participants
+                            else:
+                                # No participants on first page
+                                break
+
+                        elif response.status_code == 404:
+                            print(f"[ZoomAPI] {method_name}: Meeting not found (404)")
+                            break
+                        elif response.status_code == 400:
+                            print(f"[ZoomAPI] {method_name}: Bad request (400) - {response.text[:200]}")
+                            break
+                        elif response.status_code == 401:
+                            print(f"[ZoomAPI] {method_name}: Unauthorized (401) - refreshing token")
+                            self.access_token = None
+                            self.token_expires = 0
+                            token = self.get_access_token()
+                            headers = {'Authorization': f'Bearer {token}'}
+                            # Retry same page
+                            continue
+                        else:
+                            print(f"[ZoomAPI] {method_name}: {response.status_code} - {response.text[:200]}")
+                            break
+
+                    # If we collected any participants, return them
+                    if all_participants:
+                        print(f"[ZoomAPI] SUCCESS via {method_name}: {len(all_participants)} total participants")
+                        return all_participants
 
                 except requests.exceptions.RequestException as re:
                     print(f"[ZoomAPI] {method_name}: Request error - {re}")
@@ -594,6 +738,102 @@ class ZoomAPI:
 
         except Exception as e:
             print(f"[ZoomAPI] Past meeting error: {e}")
+            traceback.print_exc()
+            return []
+
+    def get_meeting_participants_qos(self, meeting_id):
+        """
+        Get QoS data for meeting participants using Dashboard Metrics API.
+        This includes video_output data which indicates camera status.
+
+        IMPORTANT: Requires Business/Education/Enterprise plan and
+        dashboard_meetings:read:admin scope.
+
+        Returns list of participants with video_output stats.
+        When camera is ON: video_output has bitrate, resolution, etc.
+        When camera is OFF: video_output is empty/null
+        """
+        all_participants = []
+
+        try:
+            token = self.get_access_token()
+            headers = {'Authorization': f'Bearer {token}'}
+
+            # Dashboard Metrics API endpoint
+            # Works for both live and past meetings (within last 30 days)
+            encoded_id = requests.utils.quote(requests.utils.quote(str(meeting_id), safe=''), safe='')
+            base_url = f"https://api.zoom.us/v2/metrics/meetings/{encoded_id}/participants/qos"
+
+            next_page_token = None
+            page_count = 0
+            max_pages = 200  # Increased to handle large meetings (2000 participants)
+
+            print(f"[ZoomAPI] Fetching QoS data for meeting {meeting_id}...")
+
+            while page_count < max_pages:
+                params = {'page_size': 10}  # Max 10 per page for QoS API
+                if next_page_token:
+                    params['next_page_token'] = next_page_token
+
+                response = requests.get(base_url, headers=headers, params=params)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    participants = data.get('participants', [])
+
+                    if participants:
+                        # Extract camera status from video_output
+                        for p in participants:
+                            user_qos = p.get('user_qos', [])
+                            camera_on_periods = []
+
+                            for qos_entry in user_qos:
+                                video_output = qos_entry.get('video_output', {})
+                                if video_output and video_output.get('bitrate'):
+                                    # Camera was ON during this period
+                                    camera_on_periods.append({
+                                        'bitrate': video_output.get('bitrate'),
+                                        'resolution': video_output.get('resolution'),
+                                        'frame_rate': video_output.get('frame_rate')
+                                    })
+
+                            p['camera_on_periods'] = camera_on_periods
+                            p['camera_on_count'] = len(camera_on_periods)
+
+                        all_participants.extend(participants)
+                        print(f"[ZoomAPI] QoS Page {page_count + 1}: {len(participants)} participants")
+
+                    next_page_token = data.get('next_page_token', '')
+                    page_count += 1
+
+                    if not next_page_token:
+                        break
+
+                elif response.status_code == 400:
+                    print(f"[ZoomAPI] QoS API: Bad request - {response.text[:200]}")
+                    break
+                elif response.status_code == 401:
+                    print(f"[ZoomAPI] QoS API: Unauthorized - refreshing token")
+                    self.access_token = None
+                    token = self.get_access_token()
+                    headers = {'Authorization': f'Bearer {token}'}
+                    continue
+                elif response.status_code == 403:
+                    print(f"[ZoomAPI] QoS API: Forbidden - requires Business+ plan or dashboard_meetings:read:admin scope")
+                    print(f"[ZoomAPI] Response: {response.text[:300]}")
+                    break
+                elif response.status_code == 404:
+                    print(f"[ZoomAPI] QoS API: Meeting not found")
+                    break
+                else:
+                    print(f"[ZoomAPI] QoS API: {response.status_code} - {response.text[:200]}")
+                    break
+
+            print(f"[ZoomAPI] QoS: Got {len(all_participants)} participants with camera data")
+            return all_participants
+
+        except Exception as e:
+            print(f"[ZoomAPI] QoS API error: {e}")
             traceback.print_exc()
             return []
 
@@ -612,6 +852,48 @@ def is_scout_bot(participant_name, participant_email):
     if participant_name and SCOUT_BOT_NAME:
         if SCOUT_BOT_NAME.lower() in participant_name.lower():
             return True
+    return False
+
+
+def is_calibration_participant(participant_name, participant_email):
+    """
+    Check if participant is the calibration participant (for "Move Myself" mode).
+    Returns True if:
+    - Calibration is in progress AND
+    - Participant matches the calibration participant OR is Scout Bot
+    """
+    # If no calibration in progress, only check for scout bot
+    if not meeting_state.calibration_in_progress:
+        return is_scout_bot(participant_name, participant_email)
+
+    # Check if this is Scout Bot
+    if is_scout_bot(participant_name, participant_email):
+        return True
+
+    # Check if this is the calibration participant (for "Move Myself" mode)
+    if meeting_state.calibration_mode == 'self' and meeting_state.calibration_participant_name:
+        cal_name = meeting_state.calibration_participant_name.lower().strip()
+        webhook_name = (participant_name or '').lower().strip()
+
+        if not webhook_name:
+            return False
+
+        # Check various matching strategies:
+        # 1. Exact match
+        if webhook_name == cal_name:
+            return True
+        # 2. Calibration name is substring of webhook name (e.g., "Shashank" in "Shashank Channawar")
+        if cal_name in webhook_name:
+            return True
+        # 3. Webhook name is substring of calibration name (e.g., webhook truncated)
+        if webhook_name in cal_name:
+            return True
+        # 4. First name match (first word matches)
+        cal_first = cal_name.split()[0] if cal_name else ''
+        webhook_first = webhook_name.split()[0] if webhook_name else ''
+        if cal_first and webhook_first and cal_first == webhook_first:
+            return True
+
     return False
 
 
@@ -776,9 +1058,12 @@ def handle_breakout_room_join(data):
 
     room_uuid = p['room_uuid']
 
-    # If this is Scout Bot, use this to learn webhook UUID -> room name mapping
-    if is_scout_bot(p['participant_name'], p['participant_email']):
-        print(f"  -> Scout Bot detected! Calibration in progress: {meeting_state.calibration_in_progress}")
+    # If this is calibration participant (Scout Bot or self), learn webhook UUID -> room name mapping
+    if is_calibration_participant(p['participant_name'], p['participant_email']):
+        cal_mode = meeting_state.calibration_mode
+        cal_name = meeting_state.calibration_participant_name or 'Scout Bot'
+        print(f"  -> Calibration participant detected: {p['participant_name']} (mode: {cal_mode}, expected: {cal_name})")
+        print(f"  -> Calibration in progress: {meeting_state.calibration_in_progress}")
         print(f"  -> Pending room moves: {len(meeting_state.pending_room_moves)}")
 
         # Scout Bot is moving during calibration
@@ -832,7 +1117,7 @@ def handle_breakout_room_join(data):
         else:
             print(f"  -> WARNING: Could not match webhook UUID - room_name={room_name}, room_uuid={room_uuid[:20] if room_uuid else 'None'}")
 
-        print(f"  -> Scout bot in breakout room, skipping event storage")
+        print(f"  -> Calibration participant in breakout room, skipping event storage")
         return
 
     # Get room name from mapping
@@ -871,9 +1156,9 @@ def handle_breakout_room_leave(data):
 
     print(f"[BreakoutLeave] Extracted: id={p['participant_id']}, name={p['participant_name']}")
 
-    # Skip scout bot
-    if is_scout_bot(p['participant_name'], p['participant_email']):
-        print(f"  -> Scout bot left breakout room, skipping")
+    # Skip calibration participant (Scout Bot or self)
+    if is_calibration_participant(p['participant_name'], p['participant_email']):
+        print(f"  -> Calibration participant left breakout room, skipping")
         return
 
     if not p['meeting_id']:
@@ -1175,10 +1460,10 @@ def webhook():
         elif event == 'meeting.participant_left_breakout_room':
             handle_breakout_room_leave(data)
 
-        elif event == 'meeting.participant_video_on':
+        elif event in ['meeting.participant_video_on', 'meeting.participant_video_started']:
             handle_camera_event(data, camera_on=True)
 
-        elif event == 'meeting.participant_video_off':
+        elif event in ['meeting.participant_video_off', 'meeting.participant_video_stopped']:
             handle_camera_event(data, camera_on=False)
 
         elif event == 'meeting.ended':
@@ -1208,6 +1493,11 @@ def calibration_start():
     meeting_id = data.get('meeting_id')
     meeting_uuid = data.get('meeting_uuid')
 
+    # Calibration participant info (for "Move Myself" mode)
+    calibration_mode = data.get('calibration_mode', 'scout_bot')
+    calibration_participant_name = data.get('calibration_participant_name', '')
+    calibration_participant_uuid = data.get('calibration_participant_uuid', '')
+
     if not meeting_id:
         return jsonify({'error': 'meeting_id required'}), 400
 
@@ -1217,15 +1507,27 @@ def calibration_start():
     meeting_state.calibration_in_progress = True
     meeting_state.pending_room_moves = []
 
+    # Store calibration participant info
+    meeting_state.calibration_mode = calibration_mode
+    meeting_state.calibration_participant_name = calibration_participant_name
+    meeting_state.calibration_participant_uuid = calibration_participant_uuid
+
     print(f"\n{'='*50}")
     print(f"[Calibration] STARTED for meeting {meeting_id}")
+    print(f"[Calibration] Mode: {calibration_mode}")
+    if calibration_mode == 'self':
+        print(f"[Calibration] Participant: {calibration_participant_name}")
+    else:
+        print(f"[Calibration] Using Scout Bot: {SCOUT_BOT_NAME}")
     print(f"[Calibration] Webhook UUID capture ENABLED")
     print(f"{'='*50}\n")
 
     return jsonify({
         'success': True,
         'message': 'Calibration started',
-        'meeting_id': meeting_id
+        'meeting_id': meeting_id,
+        'calibration_mode': calibration_mode,
+        'calibration_participant': calibration_participant_name or SCOUT_BOT_NAME
     })
 
 
@@ -1393,6 +1695,314 @@ def preview_report(date):
         report = generate_daily_report(date)
         return jsonify(report)
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ==============================================================================
+# MANUAL QOS COLLECTION
+# ==============================================================================
+
+@app.route('/qos/collect', methods=['POST'])
+def collect_qos_manual():
+    """
+    Manually collect QoS data for a meeting.
+    Use this when meeting.ended webhook is not received.
+
+    POST /qos/collect
+    Body: {"meeting_uuid": "xxx"} or {"meeting_id": "123456"}
+    """
+    data = request.json or {}
+    meeting_uuid = data.get('meeting_uuid', '')
+    meeting_id = data.get('meeting_id', '')
+
+    if not meeting_uuid and not meeting_id:
+        return jsonify({'error': 'meeting_uuid or meeting_id required'}), 400
+
+    print(f"[QoS] Manual collection triggered")
+    print(f"[QoS] Meeting UUID: {meeting_uuid}")
+    print(f"[QoS] Meeting ID: {meeting_id}")
+
+    collected_count = 0
+    error_count = 0
+    participants_data = []
+
+    try:
+        # Try with meeting_uuid first
+        participants = []
+        if meeting_uuid:
+            participants = zoom_api.get_past_meeting_participants(meeting_uuid)
+
+        # Fallback to meeting_id
+        if not participants and meeting_id:
+            participants = zoom_api.get_past_meeting_participants(meeting_id)
+
+        if not participants:
+            return jsonify({
+                'success': False,
+                'error': 'No participants found - meeting may still be in progress or API requires Business+ plan',
+                'meeting_uuid': meeting_uuid,
+                'meeting_id': meeting_id
+            }), 404
+
+        print(f"[QoS] Found {len(participants)} participants")
+
+        for p in participants:
+            try:
+                participant_id = safe_str(
+                    p.get('user_id') or p.get('id') or p.get('participant_user_id'),
+                    default='unknown'
+                )
+                participant_name = safe_str(
+                    p.get('name') or p.get('user_name'),
+                    default='Unknown'
+                )
+                participant_email = safe_str(
+                    p.get('user_email') or p.get('email'),
+                    default=''
+                )
+
+                # Duration in seconds from API, convert to minutes
+                duration_seconds = safe_int(p.get('duration', 0))
+                duration_minutes = duration_seconds // 60 if duration_seconds > 0 else 0
+
+                join_time = safe_str(p.get('join_time', ''))
+                leave_time = safe_str(p.get('leave_time', ''))
+
+                qos_data = {
+                    'qos_id': str(uuid_lib.uuid4()),
+                    'meeting_uuid': safe_str(meeting_uuid or meeting_id),
+                    'participant_id': participant_id,
+                    'participant_name': participant_name,
+                    'participant_email': participant_email,
+                    'join_time': join_time,
+                    'leave_time': leave_time,
+                    'duration_minutes': duration_minutes,
+                    'attentiveness_score': safe_str(p.get('attentiveness_score', '')),
+                    'recorded_at': datetime.utcnow().isoformat(),
+                    'event_date': datetime.utcnow().strftime('%Y-%m-%d')
+                }
+
+                if insert_qos_data(qos_data):
+                    collected_count += 1
+                    participants_data.append({
+                        'name': participant_name,
+                        'email': participant_email,
+                        'duration_minutes': duration_minutes
+                    })
+                else:
+                    error_count += 1
+
+            except Exception as pe:
+                error_count += 1
+                print(f"[QoS] Error processing participant: {pe}")
+
+        return jsonify({
+            'success': True,
+            'collected': collected_count,
+            'errors': error_count,
+            'participants': participants_data[:20],  # First 20 for preview
+            'total_participants': len(participants)
+        })
+
+    except Exception as e:
+        print(f"[QoS] Manual collection error: {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/qos/status', methods=['GET'])
+def qos_status():
+    """Check QoS data status for recent dates"""
+    try:
+        client = get_bq_client()
+        query = f"""
+        SELECT
+            event_date,
+            COUNT(*) as records,
+            COUNT(DISTINCT participant_name) as participants
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
+        WHERE event_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+        GROUP BY event_date
+        ORDER BY event_date DESC
+        """
+        results = list(client.query(query).result())
+
+        return jsonify({
+            'success': True,
+            'qos_data': [dict(row.items()) for row in results]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/qos/scheduled', methods=['POST'])
+def qos_scheduled_collection():
+    """
+    Scheduled QoS collection - called by Cloud Scheduler.
+    Finds yesterday's meeting UUID from BigQuery and collects QoS data.
+
+    Can also be called with a specific date:
+    POST /qos/scheduled
+    Body: {"date": "2026-02-18"} (optional, defaults to yesterday)
+    """
+    data = request.json or {}
+    target_date = data.get('date')
+
+    if not target_date:
+        # Default to yesterday
+        target_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    print(f"[ScheduledQoS] Starting collection for date: {target_date}")
+
+    try:
+        client = get_bq_client()
+
+        # Find meeting UUID(s) from participant_events for that date
+        query = f"""
+        SELECT DISTINCT meeting_uuid
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_EVENTS_TABLE}`
+        WHERE event_date = '{target_date}'
+          AND meeting_uuid IS NOT NULL
+          AND meeting_uuid != ''
+        LIMIT 5
+        """
+        results = list(client.query(query).result())
+
+        if not results:
+            return jsonify({
+                'success': False,
+                'error': f'No meetings found for date {target_date}',
+                'date': target_date
+            }), 404
+
+        meeting_uuids = [row.meeting_uuid for row in results]
+        print(f"[ScheduledQoS] Found {len(meeting_uuids)} meeting(s): {meeting_uuids}")
+
+        # Check if QoS already collected for this date
+        check_query = f"""
+        SELECT COUNT(*) as count
+        FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
+        WHERE event_date = '{target_date}'
+        """
+        check_result = list(client.query(check_query).result())[0]
+        existing_count = check_result.count
+
+        if existing_count > 50:
+            print(f"[ScheduledQoS] QoS already collected: {existing_count} records")
+            return jsonify({
+                'success': True,
+                'message': f'QoS already collected for {target_date}',
+                'existing_records': existing_count,
+                'date': target_date
+            })
+
+        # Collect QoS for each meeting
+        total_collected = 0
+        total_errors = 0
+        results_detail = []
+
+        for meeting_uuid in meeting_uuids:
+            print(f"[ScheduledQoS] Collecting for meeting: {meeting_uuid}")
+
+            try:
+                participants = zoom_api.get_past_meeting_participants(meeting_uuid)
+
+                if not participants:
+                    results_detail.append({
+                        'meeting_uuid': meeting_uuid,
+                        'status': 'no_participants'
+                    })
+                    continue
+
+                collected = 0
+                errors = 0
+
+                for p in participants:
+                    try:
+                        participant_id = safe_str(
+                            p.get('user_id') or p.get('id') or p.get('participant_user_id'),
+                            default='unknown'
+                        )
+                        participant_name = safe_str(
+                            p.get('name') or p.get('user_name'),
+                            default='Unknown'
+                        )
+                        participant_email = safe_str(
+                            p.get('user_email') or p.get('email'),
+                            default=''
+                        )
+                        duration_seconds = safe_int(p.get('duration', 0))
+                        duration_minutes = duration_seconds // 60 if duration_seconds > 0 else 0
+
+                        qos_data = {
+                            'qos_id': str(uuid_lib.uuid4()),
+                            'meeting_uuid': safe_str(meeting_uuid),
+                            'participant_id': participant_id,
+                            'participant_name': participant_name,
+                            'participant_email': participant_email,
+                            'join_time': safe_str(p.get('join_time', '')),
+                            'leave_time': safe_str(p.get('leave_time', '')),
+                            'duration_minutes': duration_minutes,
+                            'attentiveness_score': str(p.get('attentiveness_score', '')),
+                            'recorded_at': datetime.utcnow().isoformat(),
+                            'event_date': target_date  # Use target date, not today
+                        }
+
+                        if insert_qos_data(qos_data):
+                            collected += 1
+                        else:
+                            errors += 1
+
+                    except Exception as pe:
+                        errors += 1
+                        print(f"[ScheduledQoS] Error: {pe}")
+
+                total_collected += collected
+                total_errors += errors
+                results_detail.append({
+                    'meeting_uuid': meeting_uuid,
+                    'collected': collected,
+                    'errors': errors
+                })
+
+            except Exception as me:
+                print(f"[ScheduledQoS] Meeting error: {me}")
+                results_detail.append({
+                    'meeting_uuid': meeting_uuid,
+                    'status': 'error',
+                    'error': str(me)
+                })
+
+        print(f"[ScheduledQoS] Complete: {total_collected} collected, {total_errors} errors")
+
+        # Cleanup old QoS data (older than 2 days)
+        cleanup_deleted = 0
+        try:
+            cleanup_date = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d')
+            cleanup_query = f"""
+            DELETE FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_QOS_TABLE}`
+            WHERE event_date < '{cleanup_date}'
+            """
+            cleanup_job = client.query(cleanup_query)
+            cleanup_job.result()
+            cleanup_deleted = cleanup_job.num_dml_affected_rows or 0
+            print(f"[ScheduledQoS] Cleanup: Deleted {cleanup_deleted} old QoS records (before {cleanup_date})")
+        except Exception as ce:
+            print(f"[ScheduledQoS] Cleanup error (non-fatal): {ce}")
+
+        return jsonify({
+            'success': True,
+            'date': target_date,
+            'meetings_processed': len(meeting_uuids),
+            'total_collected': total_collected,
+            'total_errors': total_errors,
+            'cleanup_deleted': cleanup_deleted,
+            'details': results_detail
+        })
+
+    except Exception as e:
+        print(f"[ScheduledQoS] Error: {e}")
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -1593,6 +2203,86 @@ def test_qos_insert():
             'table': BQ_QOS_TABLE
         }
     }), 200 if success else 500
+
+
+@app.route('/test/camera-qos', methods=['GET', 'POST'])
+def test_camera_qos():
+    """
+    Test Dashboard QoS API to get camera status via video_output stats.
+
+    GET: Use current meeting ID
+    POST: {"meeting_id": "123456"} to specify meeting
+
+    Requires: Business+ plan and dashboard_meetings:read:admin scope
+    """
+    data = request.json or {}
+    meeting_id = data.get('meeting_id') or meeting_state.meeting_id
+
+    if not meeting_id:
+        return jsonify({
+            'success': False,
+            'error': 'No meeting_id provided and no active meeting',
+            'hint': 'POST with {"meeting_id": "your_meeting_id"}'
+        }), 400
+
+    print(f"[TestCameraQoS] Fetching camera data for meeting: {meeting_id}")
+
+    try:
+        # Optional search parameter
+        search_name = data.get('search', '').lower()
+
+        participants = zoom_api.get_meeting_participants_qos(meeting_id)
+
+        if not participants:
+            return jsonify({
+                'success': False,
+                'error': 'No QoS data returned - may require Business+ plan or dashboard_meetings:read:admin scope',
+                'meeting_id': meeting_id
+            }), 404
+
+        # Format results
+        camera_data = []
+        for p in participants:
+            camera_data.append({
+                'user_id': p.get('user_id'),
+                'user_name': p.get('user_name'),
+                'email': p.get('email', ''),
+                'join_time': p.get('join_time'),
+                'leave_time': p.get('leave_time'),
+                'camera_on_periods': p.get('camera_on_periods', []),
+                'camera_on_count': p.get('camera_on_count', 0),
+                'raw_user_qos_count': len(p.get('user_qos', []))
+            })
+
+        # Filter by search if provided
+        if search_name:
+            camera_data = [p for p in camera_data if search_name in p.get('user_name', '').lower() or search_name in p.get('email', '').lower()]
+            return jsonify({
+                'success': True,
+                'meeting_id': meeting_id,
+                'search': search_name,
+                'matches_found': len(camera_data),
+                'camera_data': camera_data,
+                'note': 'Filtered by search term'
+            })
+
+        return jsonify({
+            'success': True,
+            'meeting_id': meeting_id,
+            'total_participants': len(camera_data),
+            'participants_with_camera': sum(1 for p in camera_data if p['camera_on_count'] > 0),
+            'camera_data': camera_data[:50],  # Return 50 for preview, use search for specific
+            'note': 'Use {"search": "name"} to find specific participant'
+        })
+
+    except Exception as e:
+        print(f"[TestCameraQoS] Error: {e}")
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'meeting_id': meeting_id
+        }), 500
 
 
 # ==============================================================================

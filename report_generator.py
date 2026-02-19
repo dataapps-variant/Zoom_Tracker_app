@@ -119,6 +119,16 @@ def generate_daily_report(report_date=None):
       WHERE event_date = '{report_date}' AND camera_on = false
       GROUP BY participant_email, participant_name
     ),
+    qos_camera AS (
+      SELECT
+        participant_name,
+        participant_email,
+        MAX(camera_on_count) as camera_on_intervals,
+        MAX(duration_minutes) as qos_duration_min
+      FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.qos_data`
+      WHERE event_date = '{report_date}'
+      GROUP BY participant_name, participant_email
+    ),
     room_visits AS (
       SELECT
         rj.participant_email,
@@ -163,21 +173,18 @@ def generate_daily_report(report_date=None):
         PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', pm.joined_utc),
         MINUTE
       ), 0) as Total_Duration_Min,
-      -- Camera times in IST
-      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', con.cam_on_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Camera_On_IST,
-      SUBSTR(CAST(TIMESTAMP_ADD(PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E*S', coff.cam_off_time), INTERVAL 330 MINUTE) AS STRING), 12, 5) as Camera_Off_IST,
+      -- QoS duration
+      COALESCE(qc.qos_duration_min, 0) as QoS_Duration_Min,
+      -- Camera ON intervals (from QoS API)
+      COALESCE(qc.camera_on_intervals, 0) as Camera_On_Intervals,
       -- Room history
       COALESCE(rh.rooms, '-') as Room_History
     FROM participant_main pm
     LEFT JOIN room_history rh
       ON pm.participant_email = rh.participant_email
       AND pm.participant_name = rh.participant_name
-    LEFT JOIN camera_on con
-      ON pm.participant_email = con.participant_email
-      AND pm.participant_name = con.participant_name
-    LEFT JOIN camera_off coff
-      ON pm.participant_email = coff.participant_email
-      AND pm.participant_name = coff.participant_name
+    LEFT JOIN qos_camera qc
+      ON pm.participant_name = qc.participant_name
     WHERE pm.participant_name NOT LIKE '%Scout%'
     ORDER BY pm.participant_name
     """
@@ -211,15 +218,15 @@ def generate_csv(report):
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Header
+    # Header - matches query output
     writer.writerow([
         'Name',
         'Email',
         'Main_Joined_IST',
         'Main_Left_IST',
         'Total_Duration_Min',
-        'Camera_On_IST',
-        'Camera_Off_IST',
+        'QoS_Duration_Min',
+        'Camera_On_Intervals',
         'Room_History'
     ])
 
@@ -231,8 +238,8 @@ def generate_csv(report):
             p.get('Main_Joined_IST', '') or '',
             p.get('Main_Left_IST', '') or '',
             p.get('Total_Duration_Min', '') or '',
-            p.get('Camera_On_IST', '') or '',
-            p.get('Camera_Off_IST', '') or '',
+            p.get('QoS_Duration_Min', 0) or 0,
+            p.get('Camera_On_Intervals', 0) or 0,
             p.get('Room_History', '-') or '-'
         ])
 
@@ -288,6 +295,7 @@ def send_report_email(report, report_date):
                     <th>Joined IST</th>
                     <th>Left IST</th>
                     <th>Duration</th>
+                    <th>Camera ON</th>
                     <th>Room History</th>
                 </tr>
         """
@@ -298,6 +306,8 @@ def send_report_email(report, report_date):
             if len(room_history) > 80:
                 room_history = room_history[:80] + '...'
 
+            camera_intervals = p.get('Camera_On_Intervals', 0) or 0
+
             html_content += f"""
                 <tr>
                     <td>{p.get('Name', '')}</td>
@@ -305,6 +315,7 @@ def send_report_email(report, report_date):
                     <td>{p.get('Main_Joined_IST', '')}</td>
                     <td>{p.get('Main_Left_IST', '')}</td>
                     <td>{p.get('Total_Duration_Min', '')} min</td>
+                    <td>{camera_intervals}</td>
                     <td style="font-size:10px;">{room_history}</td>
                 </tr>
             """
